@@ -18,8 +18,9 @@
   </div>
   <div class="generation-mode" role="radiogroup" aria-label="生成模式">
     <span>生成模式</span>
-    <label><input type="radio" name="generationMode" value="default" onchange="syncGenerationOptionAvailability()"><span>标准生成</span></label>
-    <label><input type="radio" name="generationMode" value="fast" checked onchange="syncGenerationOptionAvailability()"><span>极速生成</span></label>
+    <label><input type="radio" name="generationMode" value="default" onchange="syncGenerationOptionAvailability()"><span>质量</span></label>
+    <label><input type="radio" name="generationMode" value="fast" checked onchange="syncGenerationOptionAvailability()"><span>平衡</span></label>
+    <label><input type="radio" name="generationMode" value="ultra_fast" onchange="syncGenerationOptionAvailability()"><span>极速</span></label>
   </div>
   <div class="generation-quality" role="radiogroup" aria-label="输出音质">
     <span>输出音质</span>
@@ -38,7 +39,7 @@
     <label><input type="radio" name="generationFps" value="10"><span>10 FPS</span></label>
     <label><input type="radio" name="generationFps" value="15" checked><span>15 FPS</span></label>
     <label><input type="radio" name="generationFps" value="30" data-standard-only><span>30 FPS</span></label>
-    <strong class="fast-fps-notice" id="fastFpsNotice" hidden>1 FPS（极速模式固定）</strong>
+    <strong class="fast-fps-notice" id="fastFpsNotice" hidden>1 FPS（平衡/极速模式固定）</strong>
   </div>
   <div class="generation-concurrency" role="radiogroup" aria-label="生成并发数">
     <span>生成并发</span>

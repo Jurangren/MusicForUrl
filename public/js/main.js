@@ -1749,7 +1749,7 @@ async function requestGeneration(path, options = {}) {
 }
 
 function isActiveGenerationJob(job) {
-  return ['queued', 'running', 'finalizing', 'cancelling', 'uploading', 'resolving_link'].includes(job?.status);
+  return ['queued', 'running', 'finalizing', 'cancelling', 'waiting_upload', 'uploading', 'resolving_link'].includes(job?.status);
 }
 
 function generationTaskStatus(job) {
@@ -1758,6 +1758,7 @@ function generationTaskStatus(job) {
     running: '生成中',
     finalizing: '正在合并',
     cancelling: '正在取消',
+    waiting_upload: '等待上传',
     uploading: '正在上传',
     resolving_link: '正在获取直链',
     completed: '已完成',
@@ -1765,7 +1766,10 @@ function generationTaskStatus(job) {
     failed: '生成失败',
     cancelled: '已取消'
   };
-  if (job.status === 'queued') {
+  if (job.status === 'queued' || job.status === 'waiting_upload') {
+    if (job.status === 'waiting_upload') {
+      return position <= 1 ? '等待上传 · 下一个开始' : `等待上传 · 前面 ${position - 1} 个任务`;
+    }
     return position <= 1 ? '排队中 · 下一个开始' : `排队中 · 前面 ${position - 1} 个任务`;
   }
   return labels[job.status] || job.message || '等待中';
@@ -1773,7 +1777,7 @@ function generationTaskStatus(job) {
 
 function generationTaskMeta(job) {
   const quality = { low: '低音质', medium: '中音质', high: '高音质' }[job.quality] || '高音质';
-  const mode = job.mode === 'fast' ? '极速' : '标准';
+  const mode = job.mode === 'ultra_fast' ? '极速' : (job.mode === 'fast' ? '平衡' : '质量');
   const source = job.source === 'qq' ? 'QQ音乐' : '网易云';
   if (job.taskType === 'upload_only') return `${source} · 仅上传本地视频`;
   return `${source} · ${quality} · ${mode} · ${escapeHtml(job.resolution || '')} · ${Number(job.fps) || 1}FPS · ${Number(job.requestedConcurrency) || 4} 并发`;
@@ -1830,7 +1834,9 @@ function renderGenerationJobs() {
     if (leftActive !== rightActive) return leftActive ? -1 : 1;
     if (left.status === 'running' || left.status === 'finalizing' || left.status === 'uploading' || left.status === 'resolving_link') return -1;
     if (right.status === 'running' || right.status === 'finalizing' || right.status === 'uploading' || right.status === 'resolving_link') return 1;
-    if (left.status === 'queued' && right.status === 'queued') return (Number(left.queuePosition) || 9999) - (Number(right.queuePosition) || 9999);
+    if (['queued', 'waiting_upload'].includes(left.status) && ['queued', 'waiting_upload'].includes(right.status)) {
+      return (Number(left.queuePosition) || 9999) - (Number(right.queuePosition) || 9999);
+    }
     return (Number(right.createdAt) || 0) - (Number(left.createdAt) || 0);
   });
   panel.hidden = jobs.length === 0;
@@ -1841,7 +1847,7 @@ function renderGenerationJobs() {
   }
 
   const activeCount = jobs.filter(isActiveGenerationJob).length;
-  const queuedCount = jobs.filter((job) => job.status === 'queued').length;
+  const queuedCount = jobs.filter((job) => job.status === 'queued' || job.status === 'waiting_upload').length;
   summary.textContent = activeCount ? `${activeCount} 个进行中 · ${queuedCount} 个排队` : `最近 ${jobs.length} 个任务`;
 
   container.innerHTML = jobs.map((job) => {
@@ -1854,7 +1860,7 @@ function renderGenerationJobs() {
       ? ` · 上传 ${Math.round(Number(job.uploadPercent) || 0)}%`
       : '';
     const cancelButton = job.canCancel
-      ? `<button class="btn generation-task-cancel" type="button" data-job-id="${escapeHtml(job.id)}" data-source="${escapeHtml(job.source)}" onclick="cancelGenerationJob(this)" ${generationJobCancelsInFlight.has(job.id) || job.status === 'cancelling' ? 'disabled' : ''}>${job.status === 'queued' ? '取消排队' : (job.status === 'cancelling' ? '正在取消…' : '取消任务')}</button>`
+      ? `<button class="btn generation-task-cancel" type="button" data-job-id="${escapeHtml(job.id)}" data-source="${escapeHtml(job.source)}" onclick="cancelGenerationJob(this)" ${generationJobCancelsInFlight.has(job.id) || job.status === 'cancelling' ? 'disabled' : ''}>${job.status === 'queued' ? '取消排队' : (job.status === 'waiting_upload' ? '取消上传' : (job.status === 'cancelling' ? '正在取消…' : '取消任务'))}</button>`
       : '';
     const confirmButton = job.canDismiss
       ? `<button class="btn btn-ghost generation-task-confirm" type="button" data-job-id="${escapeHtml(job.id)}" data-source="${escapeHtml(job.source)}" onclick="confirmGenerationJob(this)">确认</button>`
@@ -2006,13 +2012,14 @@ async function generateEntirePlaylist(generationPath, requestSequence, button) {
 }
 
 function syncGenerationOptionAvailability() {
-  const fastMode = document.querySelector('input[name="generationMode"]:checked')?.value === 'fast';
+  const selectedMode = document.querySelector('input[name="generationMode"]:checked')?.value;
+  const fixedFpsMode = selectedMode === 'fast' || selectedMode === 'ultra_fast';
   const fpsGroup = document.querySelector('.generation-fps');
   const fpsInputs = document.querySelectorAll('input[name="generationFps"]');
   const notice = document.getElementById('fastFpsNotice');
-  fpsInputs.forEach((input) => { input.disabled = fastMode; });
-  if (fpsGroup) fpsGroup.classList.toggle('is-fast-locked', fastMode);
-  if (notice) notice.hidden = !fastMode;
+  fpsInputs.forEach((input) => { input.disabled = fixedFpsMode; });
+  if (fpsGroup) fpsGroup.classList.toggle('is-fast-locked', fixedFpsMode);
+  if (notice) notice.hidden = !fixedFpsMode;
 }
 
 function confirmHighConcurrencySelection(input) {
@@ -2076,8 +2083,9 @@ async function generatePlaylist() {
     const generationOrder = document.querySelector('input[name="generationOrder"]:checked')?.value === 'shuffle'
       ? 'shuffle'
       : 'sequential';
-    const generationMode = document.querySelector('input[name="generationMode"]:checked')?.value === 'fast'
-      ? 'fast'
+    const selectedGenerationMode = document.querySelector('input[name="generationMode"]:checked')?.value;
+    const generationMode = ['fast', 'ultra_fast'].includes(selectedGenerationMode)
+      ? selectedGenerationMode
       : '';
     const generationQualityValue = document.querySelector('input[name="generationQuality"]:checked')?.value;
     const generationQuality = ['low', 'medium', 'high'].includes(generationQualityValue)
@@ -2087,7 +2095,7 @@ async function generatePlaylist() {
       ? '1920x1080'
       : '1600x900';
     const requestedFps = Number(document.querySelector('input[name="generationFps"]:checked')?.value);
-    const generationFps = generationMode === 'fast'
+    const generationFps = generationMode === 'fast' || generationMode === 'ultra_fast'
       ? 1
       : ([5, 10, 15, 30].includes(requestedFps) ? requestedFps : 15);
     const requestedConcurrency = Number(document.querySelector('input[name="generationConcurrency"]:checked')?.value);

@@ -15,7 +15,7 @@ test('puts playlist name, quality, mode, resolution and FPS at the beginning of 
       playlistId: '8123456789012345',
       version: 17
     }),
-    '晴天_高_标准_1920x1080_15FPS.mp4'
+    '晴天_高_质量_1920x1080_15FPS.mp4'
   );
   assert.equal(
     buildPlaylistOutputSuffix({ source: 'qq', mode: 'lite_video', playlistId: '9', version: 17 }),
@@ -25,13 +25,19 @@ test('puts playlist name, quality, mode, resolution and FPS at the beginning of 
     buildPlaylistOutputFilename({
       name: 'Fast list', source: 'netease', mode: 'fast', playlistId: '9', version: 17
     }),
-    'Fast list_高_极速_1920x1080_1FPS.mp4'
+    'Fast list_高_平衡_1920x1080_1FPS.mp4'
+  );
+  assert.equal(
+    buildPlaylistOutputFilename({
+      name: 'Static list', source: 'netease', mode: 'ultra_fast', playlistId: '10', version: 17
+    }),
+    'Static list_高_极速_1920x1080_1FPS.mp4'
   );
   assert.match(
     buildPlaylistOutputFilename({
       name: 'HD', source: 'qq', resolution: '1920x1080', fps: 30, playlistId: '10', version: 19
     }),
-    /^HD_高_标准_1920x1080_30FPS\.mp4$/
+    /^HD_高_质量_1920x1080_30FPS\.mp4$/
   );
 });
 

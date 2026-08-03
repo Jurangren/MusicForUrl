@@ -54,6 +54,11 @@ test('order, mode, quality, resolution, FPS and concurrency only propagate to ge
   assert.equal(fast.body.data.fps, 1);
   assert.match(fast.body.data.generationPath, /\?order=sequential&mode=fast&quality=high&resolution=1920x1080&fps=1&concurrency=4$/);
 
+  const ultraFast = await invoke(handler, createMockReq({ id: '123456', source: 'netease', mode: 'ultra_fast', fps: 30 }));
+  assert.equal(ultraFast.body.data.mode, 'ultra_fast');
+  assert.equal(ultraFast.body.data.fps, 1);
+  assert.match(ultraFast.body.data.generationPath, /\?order=sequential&mode=ultra_fast&quality=high&resolution=1920x1080&fps=1&concurrency=4$/);
+
   const standard = await invoke(handler, createMockReq({ id: '123456', source: 'netease', fps: 30 }));
   assert.equal(standard.body.data.fps, 30);
   assert.match(standard.body.data.generationPath, /resolution=1920x1080&fps=30&concurrency=4$/);

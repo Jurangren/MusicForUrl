@@ -49,7 +49,7 @@ test('preserves long metadata for seamless scrolling instead of adding an ellips
   assert.equal(normalizeTrackMeta({ name: longTitle }).title.includes('…'), false);
 });
 
-test('fast visual mode truncates metadata and removes scrolling and fades', () => {
+test('balanced visual mode truncates metadata and removes scrolling and fades', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mfu-video-fast-'));
   assert.equal(truncateToUnits('This title is much too long', 8).endsWith('...'), true);
   const assets = createTextAssets(path.join(dir, 'song'), {
@@ -74,6 +74,33 @@ test('fast visual mode truncates metadata and removes scrolling and fades', () =
   assert.match(filter, /N\/\(1\*10\.000\)/);
   assert.match(filter, /\[progress\]/);
   removeTextAssets(assets);
+});
+
+test('ultra-fast visual renders one static instrumental frame with duration only', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mfu-video-ultra-fast-'));
+  const assets = createTextAssets(path.join(dir, 'song'), {
+    name: 'Static song', subtitle: 'No lyric layout', album: 'Album', artist: 'Artist'
+  });
+  const filter = buildVisualFilter({
+    width: 1920,
+    height: 1080,
+    fps: 1,
+    duration: 245,
+    textFiles: assets.files,
+    lyricsFile: path.join(dir, 'lyrics.ass'),
+    staticText: true,
+    disableFade: true,
+    durationOnly: true,
+    singleFrame: true,
+    hasLyrics: false
+  });
+  assert.doesNotMatch(filter, /subtitles=filename=|\[bartrack\]|\[progress\]|floor\(t\/60\)|fade=t=/);
+  assert.match(filter, /text='04\\:05'/);
+  assert.match(filter, /\[artist\]\[titlescrolllayer\]overlay=x=806:y=378/);
+  assert.match(filter, /trim=end_frame=1,setpts=PTS-STARTPTS,loop=loop=-1:size=1:start=0/);
+  assert.match(filter, /setpts=N\/\(1\*TB\),format=yuv420p\[vout\]/);
+  removeTextAssets(assets);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test('keeps subtitle independent and renders artist below album', () => {

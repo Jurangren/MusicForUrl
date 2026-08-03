@@ -6,7 +6,8 @@ test('estimates remaining render time from uncached media work', () => {
   const now = 100_000;
   const timing = estimateGenerationTiming({
     status: 'running',
-    createdAt: now - 12_000,
+    createdAt: now - 60_000,
+    startedAt: now - 12_000,
     workStartedAt: now - 10_000,
     workTotalSeconds: 400,
     workCompletedSeconds: 100
@@ -18,7 +19,8 @@ test('waits for enough real progress before showing an ETA', () => {
   const now = 100_000;
   const timing = estimateGenerationTiming({
     status: 'running',
-    createdAt: now - 2_000,
+    createdAt: now - 30_000,
+    startedAt: now - 2_000,
     workStartedAt: now - 2_000,
     workTotalSeconds: 400,
     workCompletedSeconds: 0
@@ -30,8 +32,18 @@ test('waits for enough real progress before showing an ETA', () => {
 test('freezes elapsed time and reports zero ETA after completion', () => {
   const timing = estimateGenerationTiming({
     status: 'completed',
-    createdAt: 10_000,
+    createdAt: 1_000,
+    startedAt: 10_000,
     finishedAt: 25_500
   }, 0, 50_000);
   assert.deepEqual(timing, { elapsedSeconds: 15, etaSeconds: 0 });
+});
+
+test('queued time is not counted before a task actually starts', () => {
+  const timing = estimateGenerationTiming({
+    status: 'queued',
+    createdAt: 10_000,
+    startedAt: null
+  }, 0, 90_000);
+  assert.deepEqual(timing, { elapsedSeconds: 0, etaSeconds: null });
 });

@@ -86,8 +86,17 @@ function isLiteVideoMode(mode) {
   return mode === 'lite_video';
 }
 
-function isFastGenerationMode(mode) {
+function isBalancedGenerationMode(mode) {
   return mode === 'fast';
+}
+
+function isUltraFastGenerationMode(mode) {
+  return mode === 'ultra_fast';
+}
+
+function getLyricsForGeneration(adapter, songId, cookie, mode) {
+  if (isUltraFastGenerationMode(mode)) return Promise.resolve('');
+  return adapter.getLyrics(songId, cookie);
 }
 
 function getRenderQuerySuffix(mode, quality, resolution, fps) {
@@ -125,7 +134,9 @@ function getScopedSongCacheKey(songId, source, mode, quality, resolution, fps, r
   const sid = String(songId || '').trim();
   const src = source === 'qq' ? 'qq' : 'netease';
   const profile = resolveGenerationProfile({ mode, quality, resolution, fps }, { allowLiteVideo: true });
-  const modeKey = isFastGenerationMode(profile.mode) ? 'fast' : (isLiteVideoMode(profile.mode) ? 'lite_video' : 'default');
+  const modeKey = isUltraFastGenerationMode(profile.mode)
+    ? 'ultra_fast'
+    : (isBalancedGenerationMode(profile.mode) ? 'fast' : (isLiteVideoMode(profile.mode) ? 'lite_video' : 'default'));
   const base = `${src}:${modeKey}:${profile.quality}:${profile.resolution}:${profile.fps}fps:${sid}`;
   if (!renderContext || !renderContext.playlistId) return base;
   const identity = JSON.stringify({
@@ -156,7 +167,9 @@ function createSongRenderContext(job, currentIndex, totalTracks) {
 
 function getProfileFromSongCacheKey(songCacheKey) {
   const parts = String(songCacheKey || '').split(':');
-  const mode = parts[1] === 'fast' ? 'fast' : (parts[1] === 'lite_video' ? 'lite_video' : '');
+  const mode = parts[1] === 'ultra_fast'
+    ? 'ultra_fast'
+    : (parts[1] === 'fast' ? 'fast' : (parts[1] === 'lite_video' ? 'lite_video' : ''));
   return resolveGenerationProfile({
     mode,
     quality: normalizeGenerationQuality(parts[2]),
@@ -510,6 +523,7 @@ const preloadingPlaylists = new Set();
 const playlistGenerationJobs = new Map();
 const activePlaylistGenerationJobs = new Map();
 const playlistGenerationQueue = new SerialJobQueue();
+const playlistUploadQueue = new SerialJobQueue();
 const GENERATION_JOB_TTL_MS = 6 * 60 * 60 * 1000;
 
 function isGenerationJobTerminal(job) {
@@ -517,7 +531,7 @@ function isGenerationJobTerminal(job) {
 }
 
 function isGenerationJobActive(job) {
-  return ['queued', 'running', 'finalizing', 'cancelling', 'uploading', 'resolving_link'].includes(job?.status);
+  return ['queued', 'running', 'finalizing', 'cancelling', 'waiting_upload', 'uploading', 'resolving_link'].includes(job?.status);
 }
 
 const songSegmentInfo = new Map();
@@ -648,14 +662,17 @@ function getPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', pla
     playlistId,
     version: CACHE_VERSION
   };
-  const storageKey = playlistOutputIdentity(options).replace(/\.mp4$/i, '');
-  return path.join(PLAYLIST_MP4_DIR, storageKey, buildPlaylistOutputFilename(options));
+  return path.join(PLAYLIST_MP4_DIR, buildPlaylistOutputFilename(options));
 }
 
 function findPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', playlistName = '', order = 'sequential', resolution = '1920x1080', fps = 15) {
   const preferred = getPlaylistMp4Path(source, playlistId, mode, quality, playlistName, order, resolution, fps);
   if (fs.existsSync(preferred)) return preferred;
-  const suffix = buildPlaylistOutputSuffix({ source, mode, quality, resolution, fps, order, playlistId, version: CACHE_VERSION });
+  const options = { source, mode, quality, name: playlistName, resolution, fps, order, playlistId, version: CACHE_VERSION };
+  const legacyStorageKey = playlistOutputIdentity(options).replace(/\.mp4$/i, '');
+  const legacyPreferred = path.join(PLAYLIST_MP4_DIR, legacyStorageKey, buildPlaylistOutputFilename(options));
+  if (fs.existsSync(legacyPreferred)) return legacyPreferred;
+  const suffix = buildPlaylistOutputSuffix(options);
   try {
     const matches = fs.readdirSync(PLAYLIST_MP4_DIR)
       .filter((name) => name.endsWith(suffix))
@@ -913,21 +930,23 @@ async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDurati
   const tempSegmentPattern = path.join(TEMP_DIR, `${safeTempKey}_${timestamp}_seg_%04d.ts`);
   const visualBase = path.join(TEMP_DIR, `${safeTempKey}_${timestamp}`);
   const renderProfile = getProfileFromSongCacheKey(songCacheKey);
-  const fastMode = isFastGenerationMode(renderProfile.mode);
+  const balancedMode = isBalancedGenerationMode(renderProfile.mode);
+  const ultraFastMode = isUltraFastGenerationMode(renderProfile.mode);
+  const staticMode = balancedMode || ultraFastMode;
   const effectiveFps = renderProfile.fps;
   const textAssets = createTextAssets(visualBase, track, '', {
     width: renderProfile.width,
     height: renderProfile.height,
-    truncate: fastMode,
+    truncate: staticMode,
     ...renderContext
   });
   const lyricsFile = `${visualBase}_lyrics.ass`;
   const effectiveDuration = Math.max(1, Number(songDuration) || Number(track.duration) || 240);
-  const lyricsResult = createLyricsAss(lyricsFile, lyricsText, {
+  const lyricsResult = createLyricsAss(lyricsFile, ultraFastMode ? '' : lyricsText, {
     width: renderProfile.width,
     height: renderProfile.height,
     duration: effectiveDuration,
-    hardCut: fastMode
+    hardCut: staticMode
   });
   
   const cleanup = () => {
@@ -982,8 +1001,9 @@ async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDurati
       height: renderProfile.height,
       fps: effectiveFps,
       audioBitrate: getGenerationAudioBitrate(renderProfile.quality),
-      fastMode,
-      hasLyrics: lyricsResult.cueCount > 0,
+      staticMode,
+      ultraFastMode,
+      hasLyrics: !ultraFastMode && lyricsResult.cueCount > 0,
       showCollection: textAssets.showCollection,
       onProgress,
       control
@@ -1000,7 +1020,7 @@ async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDurati
   }
 }
 
-function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, tempCover, tempM3u8, tempSegmentPattern, songCacheDir, textAssets, lyricsFile, duration, width, height, fps, audioBitrate, fastMode, hasLyrics, showCollection, onProgress, control }) {
+function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, tempCover, tempM3u8, tempSegmentPattern, songCacheDir, textAssets, lyricsFile, duration, width, height, fps, audioBitrate, staticMode, ultraFastMode, hasLyrics, showCollection, onProgress, control }) {
   return new Promise((resolve, reject) => {
     const segmentDuration = CACHE_CONFIG.segmentDuration;
     const frameRate = Math.max(1, Math.round(Number(fps) || VIDEO_VISUAL_FPS));
@@ -1021,9 +1041,11 @@ function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, t
       duration,
       textFiles: textAssets.files,
       lyricsFile,
-      staticText: fastMode === true,
-      disableFade: fastMode === true,
-      hasLyrics: hasLyrics === true,
+      staticText: staticMode === true,
+      disableFade: staticMode === true,
+      durationOnly: ultraFastMode === true,
+      singleFrame: ultraFastMode === true,
+      hasLyrics: ultraFastMode ? false : hasLyrics === true,
       showCollection: showCollection === true
     });
 
@@ -1204,7 +1226,7 @@ async function autoPreloadInBackground({ songs, cookie, coverUrl, playlistId, so
     try {
       const [audioUrl, lyricsText] = await Promise.all([
         adapter.getSongUrl(rawSongId, cookie, quality),
-        adapter.getLyrics(rawSongId, cookie)
+        getLyricsForGeneration(adapter, rawSongId, cookie, mode)
       ]);
       if (!audioUrl) {
         console.log(`[自动预加载] 跳过 ${rawSongId}：无法获取URL`);
@@ -1272,7 +1294,7 @@ async function preloadNextSongs({ playlistId, currentSongId, cookie, source, mod
       try {
         const [audioUrl, lyricsText] = await Promise.all([
           adapter.getSongUrl(rawSongId, cookie, quality),
-          adapter.getLyrics(rawSongId, cookie)
+          getLyricsForGeneration(adapter, rawSongId, cookie, mode)
         ]);
         if (!audioUrl) continue;
         
@@ -1554,7 +1576,9 @@ function generationJobSnapshot(job) {
     : job;
   const timing = uploadOnly
     ? {
-        elapsedSeconds: Math.max(0, Math.floor(((job.finishedAt || Date.now()) - job.createdAt) / 1000)),
+        elapsedSeconds: job.startedAt
+          ? Math.max(0, Math.floor(((job.finishedAt || Date.now()) - job.startedAt) / 1000))
+          : 0,
         etaSeconds: null
       }
     : estimateGenerationTiming(timingJob, activeWorkSeconds);
@@ -1566,11 +1590,14 @@ function generationJobSnapshot(job) {
     playlistCover: job.playlistCover || '',
     playlistCreator: job.playlistCreator || '',
     createdAt: job.createdAt,
+    startedAt: job.startedAt || null,
     updatedAt: job.updatedAt,
     finishedAt: job.finishedAt || null,
     status: job.status,
     taskType: uploadOnly ? 'upload_only' : 'generate',
-    queuePosition: job.status === 'queued' ? playlistGenerationQueue.position(job.id) : 0,
+    queuePosition: job.status === 'queued'
+      ? (uploadOnly ? playlistUploadQueue.position(job.id) : playlistGenerationQueue.position(job.id))
+      : (job.status === 'waiting_upload' ? playlistUploadQueue.position(job.id) : 0),
     total: job.total,
     completed: job.completed,
     processed: uploadOnly ? (job.status === 'completed' ? 1 : 0) : processed,
@@ -1589,7 +1616,9 @@ function generationJobSnapshot(job) {
     concurrency: job.concurrency || 1,
     requestedConcurrency: job.requestedConcurrency || job.concurrency || 4,
     order: job.order === 'shuffle' ? 'shuffle' : 'sequential',
-    mode: isFastGenerationMode(job.mode) ? 'fast' : (isLiteVideoMode(job.mode) ? 'lite_video' : ''),
+    mode: isUltraFastGenerationMode(job.mode)
+      ? 'ultra_fast'
+      : (isBalancedGenerationMode(job.mode) ? 'fast' : (isLiteVideoMode(job.mode) ? 'lite_video' : '')),
     quality: job.quality,
     resolution: job.resolution,
     fps: job.fps,
@@ -1602,7 +1631,9 @@ function generationJobSnapshot(job) {
     shareUrl: job.shareUrl || '',
     statusPath: job.statusPath,
     cancelPath: job.cancelPath,
-    canCancel: uploadOnly ? job.status === 'queued' : ['queued', 'running', 'finalizing', 'cancelling'].includes(job.status),
+    canCancel: uploadOnly
+      ? job.status === 'queued'
+      : ['queued', 'running', 'finalizing', 'waiting_upload', 'cancelling'].includes(job.status),
     canDismiss: isGenerationJobTerminal(job)
   };
 }
@@ -1618,7 +1649,7 @@ function recordGenerationHistory(job) {
       playlist_cover: job.playlistCover || '',
       playlist_creator: job.playlistCreator || '未知作者',
       generated_at: new Date(job.renderFinishedAt || Date.now()).toISOString(),
-      generation_seconds: Math.max(0, Math.round(((job.renderFinishedAt || Date.now()) - job.createdAt) / 1000)),
+      generation_seconds: Math.max(0, Math.round(((job.renderFinishedAt || Date.now()) - (job.startedAt || job.renderFinishedAt || Date.now())) / 1000)),
       public_url: job.publicUrl || '',
       local_path: path.resolve(job.outputPath),
       upload_status: job.uploadStatus || 'pending'
@@ -1696,20 +1727,65 @@ async function uploadGeneratedVideo(job) {
   updateGenerationHistoryUpload(job);
 }
 
-async function runUploadOnlyJob(job) {
-  try {
-    await uploadGeneratedVideo(job);
-    if (job.status === 'completed') job.completed = 1;
-  } finally {
-    job.updatedAt = Date.now();
-    if (activePlaylistGenerationJobs.get(job.key) === job.id) {
-      activePlaylistGenerationJobs.delete(job.key);
+function queueGeneratedVideoUpload(job) {
+  job.status = 'waiting_upload';
+  job.message = '视频已生成，正在等待上传';
+  job.uploadStatus = 'waiting';
+  job.uploadPercent = 0;
+  job.uploadMessage = '等待上传槽';
+  job.updatedAt = Date.now();
+  playlistUploadQueue.enqueue(job.id);
+  setImmediate(startNextPlaylistUploadJob);
+}
+
+function startNextPlaylistUploadJob() {
+  if (playlistUploadQueue.runningId) return;
+
+  let job = null;
+  while (!job && playlistUploadQueue.length > 0) {
+    const jobId = playlistUploadQueue.startNext();
+    const candidate = playlistGenerationJobs.get(jobId);
+    const waitingToUpload = candidate?.status === 'waiting_upload'
+      || (candidate?.taskType === 'upload_only' && candidate?.status === 'queued');
+    if (candidate && waitingToUpload && !candidate.cancelRequested) {
+      job = candidate;
+      break;
     }
+    playlistUploadQueue.finish(jobId);
   }
+  if (!job) return;
+
+  if (job.taskType === 'upload_only' && !job.startedAt) job.startedAt = Date.now();
+
+  Promise.resolve()
+    .then(() => uploadGeneratedVideo(job))
+    .then(() => {
+      if (job.taskType === 'upload_only' && job.status === 'completed') job.completed = 1;
+    })
+    .catch((error) => {
+      job.status = 'upload_failed';
+      job.uploadStatus = 'failed';
+      job.uploadError = error?.message || '上传任务失败';
+      job.uploadMessage = '本地视频已保留，但上传任务失败';
+      job.message = '视频已生成，公开链接上传失败';
+      job.finishedAt = Date.now();
+      job.updatedAt = Date.now();
+      updateGenerationHistoryUpload(job);
+      console.error(`[上传队列] ${job.source}:${job.playlistId} 上传失败:`, error);
+    })
+    .finally(() => {
+      job.updatedAt = Date.now();
+      if (activePlaylistGenerationJobs.get(job.key) === job.id) {
+        activePlaylistGenerationJobs.delete(job.key);
+      }
+      playlistUploadQueue.finish(job.id);
+      setImmediate(startNextPlaylistUploadJob);
+    });
 }
 
 async function runPlaylistGenerationJob(job, { adapter, cookie, token }) {
   try {
+    if (!job.startedAt) job.startedAt = Date.now();
     job.status = 'running';
     job.message = '正在读取完整歌单';
     job.updatedAt = Date.now();
@@ -1818,7 +1894,7 @@ async function runPlaylistGenerationJob(job, { adapter, cookie, token }) {
             if (error?.code === 'SONG_UNPLAYABLE') throw error;
             throw new Error(`获取《${songName}》${{ low: '低', medium: '中', high: '高' }[job.quality]}音质音频地址失败：${error?.message || error}`);
           }
-          const lyricsText = await adapter.getLyrics(songId, cookie).catch((error) => {
+          const lyricsText = await getLyricsForGeneration(adapter, songId, cookie, job.mode).catch((error) => {
             console.warn(`[整单生成] 《${songName}》歌词获取失败，按无歌词继续: ${error?.message || error}`);
             return { original: '', translation: '' };
           });
@@ -1907,7 +1983,7 @@ async function runPlaylistGenerationJob(job, { adapter, cookie, token }) {
     scheduleCacheCleanup('after-playlist-merge');
     if (job.cancelRequested) throw generationCancelledError();
 
-    await uploadGeneratedVideo(job);
+    queueGeneratedVideoUpload(job);
     return;
   } catch (error) {
     const cancelled = job.cancelRequested || error?.code === 'GENERATION_CANCELLED';
@@ -1921,7 +1997,7 @@ async function runPlaylistGenerationJob(job, { adapter, cookie, token }) {
     if (!cancelled) console.error(`[整单生成] ${job.source}:${job.playlistId} 失败:`, error);
   } finally {
     releaseProtectedSongCaches(job);
-    if (activePlaylistGenerationJobs.get(job.key) === job.id) {
+    if (isGenerationJobTerminal(job) && activePlaylistGenerationJobs.get(job.key) === job.id) {
       activePlaylistGenerationJobs.delete(job.key);
     }
   }
@@ -1957,7 +2033,6 @@ function startNextPlaylistGenerationJob() {
   }
 
   Promise.resolve().then(() => {
-    if (job.taskType === 'upload_only') return runUploadOnlyJob(job);
     return runPlaylistGenerationJob(job, {
       adapter: getSourceAdapter(job.source),
       cookie: decrypt(user.cookie),
@@ -2005,7 +2080,8 @@ router.get('/generation-jobs', (req, res) => {
     data: {
       jobs,
       runningJobId: playlistGenerationQueue.runningId,
-      queuedCount: jobs.filter((job) => job.status === 'queued').length
+      uploadingJobId: playlistUploadQueue.runningId,
+      queuedCount: jobs.filter((job) => job.status === 'queued' || job.status === 'waiting_upload').length
     }
   });
 });
@@ -2020,16 +2096,24 @@ function findOwnedGenerationJob(req, res, source, user) {
 }
 
 function requestGenerationJobCancellation(job) {
-  if (job.status === 'queued') {
+  if (job.status === 'queued' || job.status === 'waiting_upload') {
+    const renderedWaitingForUpload = job.status === 'waiting_upload';
+    const waitingForUpload = job.status === 'waiting_upload' || job.taskType === 'upload_only';
     job.cancelRequested = true;
     job.status = 'cancelled';
-    job.message = '已取消排队';
+    job.message = waitingForUpload ? '已取消等待上传' : '已取消排队';
     job.finishedAt = Date.now();
     job.updatedAt = Date.now();
-    playlistGenerationQueue.remove(job.id);
+    (waitingForUpload ? playlistUploadQueue : playlistGenerationQueue).remove(job.id);
+    if (renderedWaitingForUpload) {
+      job.uploadStatus = 'cancelled';
+      job.uploadMessage = '已取消公开链接上传';
+      updateGenerationHistoryUpload(job);
+    }
     if (activePlaylistGenerationJobs.get(job.key) === job.id) activePlaylistGenerationJobs.delete(job.key);
     if (typeof job.resolveCancel === 'function') job.resolveCancel();
     setImmediate(startNextPlaylistGenerationJob);
+    setImmediate(startNextPlaylistUploadJob);
   } else if (!['completed', 'failed', 'cancelled', 'uploading', 'resolving_link', 'upload_failed'].includes(job.status)) {
     job.cancelRequested = true;
     job.status = 'cancelling';
@@ -2105,14 +2189,15 @@ router.post('/generation-jobs/reupload', (req, res) => {
     publicUrl: String(history.public_url || ''),
     shareUrl: '',
     createdAt: Date.now(),
+    startedAt: null,
     updatedAt: Date.now(),
     statusPath: '',
     cancelPath: ''
   };
   playlistGenerationJobs.set(id, job);
   activePlaylistGenerationJobs.set(key, id);
-  playlistGenerationQueue.enqueue(id);
-  setImmediate(startNextPlaylistGenerationJob);
+  playlistUploadQueue.enqueue(id);
+  setImmediate(startNextPlaylistUploadJob);
   res.status(202).json({ success: true, data: generationJobSnapshot(job) });
 });
 
@@ -2200,6 +2285,7 @@ router.post('/:token/:playlistId/generate', (req, res) => {
     publicUrl: '',
     shareUrl: '',
     createdAt: Date.now(),
+    startedAt: null,
     updatedAt: Date.now(),
     playbackToken: token,
     statusPath: generationStatusPath(source, token, playlistId, id),
@@ -2262,7 +2348,7 @@ router.get('/:token/:playlistId/playlist.mp4', (req, res) => {
   res.setHeader('Content-Type', 'video/mp4');
   res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Cache-Control', 'private, max-age=86400');
-  const modeLabel = isFastGenerationMode(mode) ? '极速' : '标准';
+  const modeLabel = isUltraFastGenerationMode(mode) ? '极速' : (isBalancedGenerationMode(mode) ? '平衡' : '质量');
   const qualityLabel = { low: '低', medium: '中', high: '高' }[quality];
   const downloadName = `${sanitizeOutputFileStem(playlistName, `playlist-${playlistId}`)}_${qualityLabel}_${modeLabel}_${resolution}_${fps}FPS.mp4`;
   res.setHeader(
@@ -2636,7 +2722,7 @@ router.post('/:token/:playlistId/preload', async (req, res) => {
       try {
         const [audioUrl, lyricsText] = await Promise.all([
           adapter.getSongUrl(songId, cookie, quality),
-          adapter.getLyrics(songId, cookie)
+          getLyricsForGeneration(adapter, songId, cookie, mode)
         ]);
         if (!audioUrl) {
           results.push({ id: songId, name: song.name, status: 'no_url' });

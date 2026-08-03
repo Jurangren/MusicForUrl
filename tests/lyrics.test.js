@@ -122,7 +122,7 @@ test('rapid lyric cues never overlap and skip low-frame-count slide animations',
   assert.doesNotMatch(content, /\\b(?:0|700|900)/);
 });
 
-test('fast lyrics hard-cut between states without slide animation', () => {
+test('balanced-mode lyrics hard-cut between states without slide animation', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mfu-lyrics-fast-'));
   const filePath = path.join(dir, 'lyrics.ass');
   createLyricsAss(filePath, '[00:00.00]one\n[00:02.00]two\n[00:04.00]three', {

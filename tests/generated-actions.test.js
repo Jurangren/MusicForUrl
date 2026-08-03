@@ -39,7 +39,7 @@ test('render completion exposes local path before TMPLINK upload progress', () =
   assert.match(main, /if \(job\.localPath\)/);
   assert.match(main, /function updateUploadProgress\(job = \{\}\)/);
   assert.match(hls, /localPath: job\.outputPath \? path\.resolve\(job\.outputPath\) : ''/);
-  assert.match(hls, /await uploadGeneratedVideo\(job\)/);
+  assert.match(hls, /queueGeneratedVideoUpload\(job\)/);
 });
 
 test('generated result uses only the TMPLINK public direct URL', () => {
@@ -64,10 +64,11 @@ test('playlist generation is submitted to a refresh-safe multi-task queue', () =
   assert.match(main, /qqApi\('\/playlist-video\/generation-jobs'/);
   assert.match(main, /async function cancelGenerationJob\(button\)/);
   assert.match(hls, /const playlistGenerationQueue = new SerialJobQueue\(\)/);
+  assert.match(hls, /const playlistUploadQueue = new SerialJobQueue\(\)/);
   assert.match(hls, /router\.get\('\/generation-jobs'/);
   assert.match(hls, /playlistGenerationQueue\.enqueue\(id\)/);
   assert.match(hls, /job\.status === 'queued'/);
-  assert.match(hls, /playlistGenerationQueue\.remove\(job\.id\)/);
+  assert.match(hls, /waitingForUpload \? playlistUploadQueue : playlistGenerationQueue/);
   assert.match(main, /async function confirmGenerationJob\(button\)/);
   assert.match(main, /generation-task-confirm/);
   assert.match(hls, /router\.post\('\/generation-jobs\/:jobId\/dismiss'/);
@@ -103,20 +104,43 @@ test('generation order can be selected before creating the MP4', () => {
   assert.match(hls, /job\.order === 'shuffle' \? shuffleTracks\(playlistTracks\) : playlistTracks/);
 });
 
-test('fast generation mode can be selected below playback order', () => {
+test('quality, balanced and ultra-fast generation modes can be selected below playback order', () => {
   const home = fs.readFileSync(path.join(publicDir, 'views', 'home.html'), 'utf8');
   const main = fs.readFileSync(path.join(publicDir, 'js', 'main.js'), 'utf8');
+  const hls = fs.readFileSync(path.join(__dirname, '..', 'routes', 'hls.js'), 'utf8');
   assert.match(home, /name="generationMode" value="default"/);
-  assert.match(home, /name="generationMode" value="fast" checked/);
-  assert.match(main, /generationMode.*=== 'fast'/s);
+  assert.match(home, /name="generationMode" value="default"[^>]*><span>质量<\/span>/);
+  assert.match(home, /name="generationMode" value="fast" checked[^>]*><span>平衡<\/span>/);
+  assert.match(home, /name="generationMode" value="ultra_fast"[^>]*><span>极速<\/span>/);
+  assert.match(main, /\['fast', 'ultra_fast'\]\.includes\(selectedGenerationMode\)/);
   assert.match(main, /'&mode=' \+ generationMode/);
   assert.match(home, /name="generationResolution" value="1600x900"/);
   assert.match(home, /name="generationResolution" value="1920x1080" checked/);
   assert.match(home, /name="generationFps" value="15" checked/);
   assert.match(home, /name="generationFps" value="30" data-standard-only/);
   assert.match(home, /id="fastFpsNotice"[^>]*hidden>1 FPS/);
-  assert.match(main, /input\.disabled = fastMode/);
-  assert.match(main, /generationMode === 'fast'\s*\? 1/);
+  assert.match(main, /input\.disabled = fixedFpsMode/);
+  assert.match(main, /generationMode === 'fast' \|\| generationMode === 'ultra_fast'/);
+  assert.match(hls, /if \(isUltraFastGenerationMode\(mode\)\) return Promise\.resolve\(''\)/);
+  assert.match(hls, /durationOnly: ultraFastMode === true/);
+  assert.match(hls, /singleFrame: ultraFastMode === true/);
+});
+
+test('render and upload use separate single-slot queues', () => {
+  const hls = fs.readFileSync(path.join(__dirname, '..', 'routes', 'hls.js'), 'utf8');
+  assert.match(hls, /const playlistGenerationQueue = new SerialJobQueue\(\)/);
+  assert.match(hls, /const playlistUploadQueue = new SerialJobQueue\(\)/);
+  assert.match(hls, /job\.outputPath = await buildPlaylistMp4[\s\S]*queueGeneratedVideoUpload\(job\)/);
+  assert.match(hls, /playlistUploadQueue\.enqueue\(job\.id\)/);
+  assert.match(hls, /if \(playlistUploadQueue\.runningId\) return/);
+  assert.match(hls, /playlistGenerationQueue\.finish\(job\.id\)[\s\S]*startNextPlaylistGenerationJob/);
+  assert.match(hls, /taskType: 'upload_only'[\s\S]*playlistUploadQueue\.enqueue\(id\)/);
+});
+
+test('playlist MP4 files are written directly in the output root', () => {
+  const hls = fs.readFileSync(path.join(__dirname, '..', 'routes', 'hls.js'), 'utf8');
+  assert.match(hls, /return path\.join\(PLAYLIST_MP4_DIR, buildPlaylistOutputFilename\(options\)\)/);
+  assert.doesNotMatch(hls, /return path\.join\(PLAYLIST_MP4_DIR, storageKey, buildPlaylistOutputFilename/);
 });
 
 test('audio quality can be selected and defaults to high', () => {
@@ -171,4 +195,6 @@ test('generation progress displays elapsed time and estimated wait time', () => 
   assert.match(main, /job\.status === 'finalizing'.*正在合并/s);
   assert.match(hls, /elapsedSeconds: timing\.elapsedSeconds/);
   assert.match(hls, /etaSeconds: timing\.etaSeconds/);
+  assert.match(hls, /if \(!job\.startedAt\) job\.startedAt = Date\.now\(\)/);
+  assert.match(hls, /generation_seconds:[^\n]*job\.startedAt/);
 });
