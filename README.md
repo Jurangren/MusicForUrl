@@ -411,4 +411,4 @@ MusicForUrl/
 
 ## 友情链接
 
-[Linux.do](https://linux.do)
+[TMPLINK](https://www.ttttt.link)
