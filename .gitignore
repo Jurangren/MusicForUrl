@@ -301,6 +301,14 @@ core.*
 # Miscellaneous
 # ============================================================================
 
+# Local API experiments/reference clients (may contain copied credentials)
+/ttttt_api.py
+
+# Local service launchers and scratch output
+*.pid
+*.part
+*.part-*
+
 # Backup files
 *.bak
 *.backup

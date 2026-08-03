@@ -33,6 +33,7 @@ services:
       # 音质：low(128k) / medium(192k) / high(320k) / lossless
       # MUSIC_QUALITY: low
       # 站点访问密码（留空则不启用）
+      # 预设后台密钥；留空时首次访问会引导创建
       # SITE_PASSWORD:
       # 信任代理层数（反向代理后面时设置，例如 1 或 2）
       # TRUST_PROXY: 1

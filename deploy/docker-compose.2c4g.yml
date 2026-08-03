@@ -50,8 +50,8 @@ services:
       HLS_FFMPEG_THREADS: 1
 
       # 静态封面视频：降低分辨率 + 帧率，可显著减轻 x264 压力
-      COVER_WIDTH: 1280
-      COVER_HEIGHT: 720
+      COVER_WIDTH: 1920
+      COVER_HEIGHT: 1080
       COVER_FPS: 2
 
       # 音质：low 文件小、下载快（更省带宽与磁盘）

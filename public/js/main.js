@@ -49,7 +49,37 @@ const SPA_VIEW_CACHE = new Map();
 let lastAutoPlayId = null;
 let lastGeneratedUrl = '';
 let lastGeneratedUrls = [];
-let selectedGeneratedUrlType = 'hls';
+let lastGeneratedLocalPath = '';
+let selectedGeneratedUrlType = 'mp4';
+let generationRequestSequence = 0;
+let activeGenerationCancelPath = '';
+let generationCancelInFlight = false;
+const generationJobs = new Map();
+const generationJobCancelsInFlight = new Set();
+let generationJobsPollTimer = null;
+let generationJobsPollInFlight = false;
+let tmplinkSettingsLoadedFor = '';
+let tmplinkSettingsLoadedAccountToken = '';
+let tmplinkSettingsLoading = false;
+let tmplinkSettingsState = null;
+const GENERATION_HISTORY_PLATFORM_KEY = 'generationHistoryPlatform';
+let generationHistoryPlatform = localStorage.getItem(GENERATION_HISTORY_PLATFORM_KEY) || '';
+let generationHistoryPage = 1;
+let generationHistoryLoading = false;
+let generationHistoryLoadSequence = 0;
+const HIGH_CONCURRENCY_WARNING_KEY = 'highConcurrencyWarningConfirmed';
+let lastGenerationConcurrency = 4;
+
+async function lockSiteAccess() {
+  try {
+    await fetch('/api/site-access/logout', { method: 'POST', credentials: 'same-origin' });
+  } finally {
+    sessionStorage.removeItem('sitePassword');
+    window.location.replace('/');
+  }
+}
+
+window.lockSiteAccess = lockSiteAccess;
 const MFU_ERROR = (typeof window !== 'undefined' && window.MfuError) ? window.MfuError : null;
 
 function hasSpaContainer() {
@@ -59,16 +89,22 @@ function hasSpaContainer() {
 function resolveViewFromPath(pathname) {
   const p = (pathname || '/').replace(/\/+$/, '') || '/';
   if (p === '/user' || p === '/user.html') return 'user';
+  if (p === '/generated' || p === '/generated.html') return 'generated';
   return 'home';
 }
 
 function viewTitle(view) {
   if (view === 'user') return '个人中心 - MusicForUrl';
+  if (view === 'generated') return '历史生成 - MusicForUrl';
   return 'MusicForUrl';
 }
 
 function isUserViewActive() {
   return resolveViewFromPath(window.location.pathname) === 'user';
+}
+
+function isGenerationHistoryViewActive() {
+  return resolveViewFromPath(window.location.pathname) === 'generated';
 }
 
 function rememberPersonalPlatform(platform) {
@@ -225,8 +261,8 @@ function maybeRestoreHomeState() {
     if (name) name.textContent = currentPlaylist.name || '';
     if (meta) meta.textContent = `共 ${currentPlaylist.songCount} 首`;
     if (urlOptions) renderGeneratedUrlOptions();
+    renderGeneratedLocalPath(lastGeneratedLocalPath);
     result.classList.add('show');
-    updateFavoriteBtn();
   }
 }
 
@@ -298,8 +334,27 @@ async function maybeAutoplayFromUrl() {
 function onViewMounted(view) {
   if (view === 'home') {
     restorePlatformTab();
+    syncGenerationOptionAvailability();
+    lastGenerationConcurrency = Number(document.querySelector('input[name="generationConcurrency"]:checked')?.value) || 4;
     maybeRestoreHomeState();
+    startGenerationJobsPolling();
     maybeAutoplayFromUrl();
+    return;
+  }
+
+  stopGenerationJobsPolling();
+
+  if (view === 'generated') {
+    if (!token && !qqToken) {
+      showToast('请先登录', 'error');
+      showLogin();
+      navigate('/', { replace: true });
+      return;
+    }
+    if (generationHistoryPlatform !== 'netease' && generationHistoryPlatform !== 'qq') {
+      generationHistoryPlatform = resolveDefaultPersonalPlatform();
+    }
+    switchGenerationHistoryPlatform(generationHistoryPlatform);
     return;
   }
 
@@ -418,6 +473,9 @@ function renderPersonalCenter() {
     qqAuthState.innerHTML = renderPersonalAuthPanel('qq');
     qqContent.style.display = 'none';
   }
+
+  renderTmplinkSettings();
+  loadTmplinkSettings();
 }
 
 function initSpa() {
@@ -824,6 +882,316 @@ async function qqApi(path, options = {}, scope = 'UNKNOWN') {
   return requestJson('/api/qq', path, options, scope, 'X-QQ-Token', qqToken);
 }
 
+function showTmplinkHelp() {
+  const modal = document.getElementById('tmplinkHelpModal');
+  if (modal) modal.classList.add('show');
+}
+
+function hideTmplinkHelp() {
+  const modal = document.getElementById('tmplinkHelpModal');
+  if (modal) modal.classList.remove('show');
+}
+
+function tmplinkSettingsApi(options = {}) {
+  const source = personalPlatform === 'qq' ? 'qq' : 'netease';
+  const header = source === 'qq' ? 'X-QQ-Token' : 'X-Token';
+  const value = source === 'qq' ? qqToken : token;
+  return requestJson('/api', `/upload-settings/tmplink?source=${source}`, options, 'TMPLINK_SETTINGS', header, value);
+}
+
+function renderTmplinkSettings() {
+  const source = personalPlatform === 'qq' ? 'qq' : 'netease';
+  const loggedIn = source === 'qq' ? Boolean(qqToken) : Boolean(token);
+  const accountToken = source === 'qq' ? qqToken : token;
+  const sourceLabel = document.getElementById('tmplinkAccountSource');
+  const input = document.getElementById('tmplinkTokenInput');
+  const saveButton = document.getElementById('saveTmplinkTokenBtn');
+  const removeButton = document.getElementById('removeTmplinkTokenBtn');
+  const status = document.getElementById('tmplinkSettingsStatus');
+  if (!input || !saveButton || !status) return;
+
+  if (sourceLabel) sourceLabel.textContent = source === 'qq' ? 'QQ 音乐账号' : '网易云账号';
+  input.disabled = !loggedIn || tmplinkSettingsLoading;
+  saveButton.disabled = !loggedIn || tmplinkSettingsLoading;
+  saveButton.textContent = tmplinkSettingsLoading ? '正在验证…' : '验证并保存';
+  const currentState = tmplinkSettingsLoadedFor === source && tmplinkSettingsLoadedAccountToken === accountToken
+    ? tmplinkSettingsState
+    : null;
+  if (!loggedIn) {
+    status.textContent = '请先登录当前音乐账号再配置';
+    if (removeButton) removeButton.hidden = true;
+  } else if (tmplinkSettingsLoading) {
+    status.textContent = '正在读取 TMPLINK 配置…';
+  } else if (currentState?.configured) {
+    const expiry = currentState.expiresAt ? `，有效期至 ${new Date(currentState.expiresAt).toLocaleString()}` : '';
+    status.textContent = `已配置并通过服务器验证（UID ${currentState.uid || '-'}${expiry}）`;
+    if (removeButton) removeButton.hidden = false;
+  } else {
+    status.textContent = '尚未配置；Token 会先通过 TMPLINK 服务器验证，成功后才加密保存';
+    if (removeButton) removeButton.hidden = true;
+  }
+}
+
+async function loadTmplinkSettings(force = false) {
+  if (!isUserViewActive()) return;
+  const source = personalPlatform === 'qq' ? 'qq' : 'netease';
+  const accountToken = source === 'qq' ? qqToken : token;
+  const loggedIn = Boolean(accountToken);
+  if (!loggedIn || tmplinkSettingsLoading || (!force && tmplinkSettingsLoadedFor === source && tmplinkSettingsLoadedAccountToken === accountToken)) {
+    renderTmplinkSettings();
+    return;
+  }
+  tmplinkSettingsLoading = true;
+  renderTmplinkSettings();
+  const response = await tmplinkSettingsApi();
+  tmplinkSettingsLoading = false;
+  if (response.success) {
+    tmplinkSettingsLoadedFor = source;
+    tmplinkSettingsLoadedAccountToken = accountToken;
+    tmplinkSettingsState = response.data || { configured: false };
+  } else {
+    tmplinkSettingsLoadedFor = source;
+    tmplinkSettingsLoadedAccountToken = accountToken;
+    tmplinkSettingsState = { configured: false };
+    const status = document.getElementById('tmplinkSettingsStatus');
+    if (status) status.textContent = response.message || '读取 TMPLINK 配置失败';
+  }
+  renderTmplinkSettings();
+}
+
+async function saveTmplinkToken() {
+  const source = personalPlatform === 'qq' ? 'qq' : 'netease';
+  const accountToken = source === 'qq' ? qqToken : token;
+  const input = document.getElementById('tmplinkTokenInput');
+  const value = String(input?.value || '').trim();
+  if (!value) return showToast('请输入 TMPLINK Token', 'error');
+  tmplinkSettingsLoading = true;
+  renderTmplinkSettings();
+  const response = await tmplinkSettingsApi({ method: 'PUT', body: JSON.stringify({ token: value }) });
+  tmplinkSettingsLoading = false;
+  if (!response.success) {
+    renderTmplinkSettings();
+    return showActionError(response, 'TMPLINK Token 验证失败');
+  }
+  if (input) input.value = '';
+  tmplinkSettingsLoadedFor = source;
+  tmplinkSettingsLoadedAccountToken = accountToken;
+  tmplinkSettingsState = response.data || { configured: true };
+  renderTmplinkSettings();
+  showToast('TMPLINK Token 验证通过并已保存');
+}
+
+async function removeTmplinkToken() {
+  const source = personalPlatform === 'qq' ? 'qq' : 'netease';
+  const accountToken = source === 'qq' ? qqToken : token;
+  tmplinkSettingsLoading = true;
+  renderTmplinkSettings();
+  const response = await tmplinkSettingsApi({ method: 'DELETE' });
+  tmplinkSettingsLoading = false;
+  if (!response.success) {
+    renderTmplinkSettings();
+    return showActionError(response, '移除 TMPLINK Token 失败');
+  }
+  tmplinkSettingsLoadedFor = source;
+  tmplinkSettingsLoadedAccountToken = accountToken;
+  tmplinkSettingsState = { configured: false };
+  renderTmplinkSettings();
+  showToast('已移除 TMPLINK Token');
+}
+
+function generationHistoryApi(platform, page) {
+  const source = platform === 'qq' ? 'qq' : 'netease';
+  const header = source === 'qq' ? 'X-QQ-Token' : 'X-Token';
+  const value = source === 'qq' ? qqToken : token;
+  return requestJson(
+    '/api',
+    `/generation-history?source=${source}&page=${Math.max(1, Number(page) || 1)}&limit=10`,
+    {},
+    'GENERATION_HISTORY',
+    header,
+    value
+  );
+}
+
+function switchGenerationHistoryPlatform(platform) {
+  generationHistoryPlatform = platform === 'qq' ? 'qq' : 'netease';
+  localStorage.setItem(GENERATION_HISTORY_PLATFORM_KEY, generationHistoryPlatform);
+  const neteaseButton = document.getElementById('generationHistoryNetease');
+  const qqButton = document.getElementById('generationHistoryQQ');
+  if (neteaseButton) neteaseButton.classList.toggle('active', generationHistoryPlatform === 'netease');
+  if (qqButton) qqButton.classList.toggle('active', generationHistoryPlatform === 'qq');
+  generationHistoryPage = 1;
+  loadGenerationHistory(1);
+}
+
+function formatGenerationHistoryDate(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value || '-') : date.toLocaleString();
+}
+
+function formatGenerationHistoryExpiration(value) {
+  const generatedAt = new Date(value);
+  if (Number.isNaN(generatedAt.getTime())) return '-';
+  const expiresAt = new Date(generatedAt.getTime() + 7 * 24 * 60 * 60 * 1000);
+  const remainingMs = expiresAt.getTime() - Date.now();
+  const totalHours = Math.floor(Math.abs(remainingMs) / (60 * 60 * 1000));
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return remainingMs >= 0 ? `${days}天${hours}小时后` : `已过期${days}天${hours}小时`;
+}
+
+function generationHistoryActionApi(source, jobId, action, options = {}) {
+  const platform = source === 'qq' ? 'qq' : 'netease';
+  const header = platform === 'qq' ? 'X-QQ-Token' : 'X-Token';
+  const value = platform === 'qq' ? qqToken : token;
+  return requestJson(
+    '/api',
+    `/generation-history/${encodeURIComponent(jobId)}/${action}?source=${platform}`,
+    options,
+    `GENERATION_HISTORY_${String(action).toUpperCase()}`,
+    header,
+    value
+  );
+}
+
+function generationHistoryLinkStatusId(jobId) {
+  return `generation-history-link-${String(jobId || '').replace(/[^A-Za-z0-9_-]/g, '')}`;
+}
+
+async function checkGenerationHistoryLink(item, source, sequence) {
+  if (!item.publicUrl || sequence !== generationHistoryLoadSequence) return;
+  const element = document.getElementById(generationHistoryLinkStatusId(item.jobId));
+  if (!element) return;
+  element.className = 'generation-history-link-status is-checking';
+  element.textContent = '检测中…';
+  const response = await generationHistoryActionApi(source, item.jobId, 'check-link', { method: 'POST', body: '{}' });
+  if (sequence !== generationHistoryLoadSequence) return;
+  const target = document.getElementById(generationHistoryLinkStatusId(item.jobId));
+  if (!target) return;
+  if (!response.success) {
+    target.className = 'generation-history-link-status is-invalid';
+    target.textContent = '检测失败';
+    target.title = response.message || '';
+    return;
+  }
+  const result = response.data || {};
+  target.className = `generation-history-link-status ${result.valid ? 'is-valid' : 'is-invalid'}`;
+  target.textContent = result.valid
+    ? `有效 · HTTP ${result.statusCode || 200}`
+    : `无效${result.statusCode ? ` · HTTP ${result.statusCode}` : ''}`;
+  target.title = result.error || `检测时间：${formatGenerationHistoryDate(result.checkedAt)}`;
+}
+
+async function checkGenerationHistoryLinks(rows, source, sequence) {
+  const pending = rows.filter((item) => item.publicUrl);
+  let nextIndex = 0;
+  async function worker() {
+    while (sequence === generationHistoryLoadSequence) {
+      const index = nextIndex++;
+      if (index >= pending.length) return;
+      await checkGenerationHistoryLink(pending[index], source, sequence);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(3, pending.length) }, () => worker()));
+}
+
+async function reuploadGenerationHistory(jobId, source, button) {
+  if (button) {
+    button.disabled = true;
+    button.textContent = '正在加入…';
+  }
+  const callApi = source === 'qq' ? qqApi : api;
+  const response = await callApi('/playlist-video/generation-jobs/reupload', {
+    method: 'POST',
+    body: JSON.stringify({ historyJobId: jobId })
+  }, source === 'qq' ? 'QQ_GENERATION_REUPLOAD' : 'GENERATION_REUPLOAD');
+  if (!response.success) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '重新上传';
+    }
+    return showActionError(response, '重新上传任务创建失败');
+  }
+  if (button) button.textContent = '已加入队列';
+  showToast('仅上传任务已加入生成队列，可在首页查看进度');
+}
+
+function copyGenerationHistoryValue(value) {
+  const text = String(value || '');
+  if (!text) return;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    navigator.clipboard.writeText(text).then(() => showToast('复制成功')).catch(() => fallbackCopyText(text));
+  } else {
+    fallbackCopyText(text);
+  }
+}
+
+async function loadGenerationHistory(page = 1) {
+  if (!isGenerationHistoryViewActive() || generationHistoryLoading) return;
+  const list = document.getElementById('generationHistoryList');
+  const pagination = document.getElementById('generationHistoryPagination');
+  if (!list || !pagination) return;
+  const source = generationHistoryPlatform === 'qq' ? 'qq' : 'netease';
+  const loggedIn = source === 'qq' ? Boolean(qqToken) : Boolean(token);
+  if (!loggedIn) {
+    list.innerHTML = `<div class="empty">请先登录${source === 'qq' ? 'QQ 音乐' : '网易云音乐'}后查看生成记录</div>`;
+    pagination.innerHTML = '';
+    return;
+  }
+
+  generationHistoryLoading = true;
+  const loadSequence = ++generationHistoryLoadSequence;
+  generationHistoryPage = Math.max(1, Number(page) || 1);
+  list.innerHTML = '<div style="text-align:center;padding:2rem"><span class="loading"></span></div>';
+  pagination.innerHTML = '';
+  const response = await generationHistoryApi(source, generationHistoryPage);
+  generationHistoryLoading = false;
+  if (!response.success) {
+    return renderInlineError(list, response, '读取历史生成记录失败');
+  }
+
+  const rows = Array.isArray(response.data) ? response.data : [];
+  if (rows.length === 0) {
+    list.innerHTML = '<div class="empty">暂时没有生成记录</div>';
+    return;
+  }
+
+  list.innerHTML = rows.map((item) => {
+    const rawUrl = String(item.publicUrl || '');
+    const publicUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : '';
+    const localPath = String(item.localPath || '');
+    const linkField = publicUrl
+      ? `<div class="generation-history-link"><a href="${escapeHtml(publicUrl)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(publicUrl)}">${escapeHtml(publicUrl)}</a><span class="generation-history-link-status is-checking" id="${generationHistoryLinkStatusId(item.jobId)}">等待检测</span></div>`
+      : `<code>${escapeHtml(item.uploadStatus === 'not_configured' ? '未配置 TMPLINK Token' : '未获取公开链接')}</code>`;
+    return `
+      <article class="generation-history-card">
+        <img class="generation-history-cover" src="${imageSrc(item.playlistCover)}" alt="" referrerpolicy="no-referrer" loading="lazy">
+        <div class="generation-history-content">
+          <h3 class="generation-history-title">${escapeHtml(item.playlistName || '未命名歌单')}</h3>
+          <div class="generation-history-author">作者：${escapeHtml(item.playlistCreator || '未知作者')}</div>
+          <div class="generation-history-meta">
+            <span>生成时间：${escapeHtml(formatGenerationHistoryDate(item.generatedAt))}</span>
+            <span>生成耗时：${formatGenerationDuration(item.generationSeconds)}</span>
+            <span>预计过期：${escapeHtml(formatGenerationHistoryExpiration(item.generatedAt))}</span>
+          </div>
+          <div class="generation-history-fields">
+            <div class="generation-history-field">
+              <span>公开链接</span>${linkField}
+              ${publicUrl ? `<button class="btn btn-ghost generation-history-copy" type="button" data-value="${escapeHtml(publicUrl)}" onclick="copyGenerationHistoryValue(this.dataset.value)">复制</button>` : ''}
+            </div>
+            <div class="generation-history-field">
+              <span>本地路径</span><code title="${escapeHtml(localPath)}">${escapeHtml(localPath || '-')}</code>
+              ${localPath ? `<div class="generation-history-actions"><button class="btn btn-ghost generation-history-copy" type="button" data-value="${escapeHtml(localPath)}" onclick="copyGenerationHistoryValue(this.dataset.value)">复制</button><button class="btn btn-ghost generation-history-copy" type="button" onclick="reuploadGenerationHistory('${escapeHtml(item.jobId)}','${source}',this)">重新上传</button></div>` : ''}
+            </div>
+          </div>
+        </div>
+      </article>
+    `;
+  }).join('');
+  renderPagination('generationHistoryPagination', Number(response.total) || 0, generationHistoryPage, Number(response.limit) || 10, 'loadGenerationHistory');
+  checkGenerationHistoryLinks(rows, source, loadSequence);
+}
+
 function installGlobalUiErrorHandlers() {
   if (!MFU_ERROR || typeof MFU_ERROR.installGlobalErrorHandlers !== 'function') return;
   MFU_ERROR.installGlobalErrorHandlers({
@@ -847,8 +1215,8 @@ function switchPlatform(platform) {
   if (input) {
     input.value = '';
     input.placeholder = platform === 'qq'
-      ? '粘贴QQ音乐歌单链接或ID'
-      : '粘贴网易云歌单链接或ID';
+      ? '粘贴QQ音乐歌单/单曲链接或歌单ID'
+      : '粘贴网易云歌单/单曲链接或歌单ID';
   }
 
   const result = document.getElementById('resultSection');
@@ -856,6 +1224,17 @@ function switchPlatform(platform) {
   currentPlaylist = null;
   lastGeneratedUrl = '';
   lastGeneratedUrls = [];
+  generationRequestSequence++;
+}
+
+function renderGeneratedLocalPath(localPath = '') {
+  const container = document.getElementById('generatedLocalPath');
+  const value = document.getElementById('generatedLocalPathValue');
+  if (!container || !value) return;
+  const normalized = String(localPath || '').trim();
+  value.textContent = normalized;
+  value.title = normalized;
+  container.hidden = !normalized;
 }
 
 function restorePlatformTab() {
@@ -867,8 +1246,8 @@ function restorePlatformTab() {
   const input = document.getElementById('playlistInput');
   if (input) {
     input.placeholder = currentPlatform === 'qq'
-      ? '粘贴QQ音乐歌单链接或ID'
-      : '粘贴网易云歌单链接或ID';
+      ? '粘贴QQ音乐歌单/单曲链接或歌单ID'
+      : '粘贴网易云歌单/单曲链接或歌单ID';
   }
 }
 
@@ -1240,6 +1619,442 @@ function logoutQQ(notify = true) {
   if (notify) showToast('已退出QQ音乐登录');
 }
 
+function formatGenerationDuration(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  return hours > 0
+    ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+    : `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function updateUploadProgress(job = {}) {
+  const container = document.getElementById('uploadProgress');
+  const status = document.getElementById('uploadStatus');
+  const percent = document.getElementById('uploadPercent');
+  const track = document.getElementById('uploadProgressTrack');
+  const bar = document.getElementById('uploadProgressBar');
+  const message = document.getElementById('uploadProgressMessage');
+  if (!container) return;
+  const uploadStatus = String(job.uploadStatus || 'waiting');
+  const shouldShow = Boolean(job.localPath) && uploadStatus !== 'waiting';
+  container.hidden = !shouldShow;
+  if (!shouldShow) return;
+  const value = Math.max(0, Math.min(100, Number(job.uploadPercent) || 0));
+  const failed = uploadStatus === 'failed' || uploadStatus === 'not_configured' || job.status === 'upload_failed';
+  const completed = uploadStatus === 'completed' && Boolean(job.publicUrl);
+  container.classList.toggle('is-failed', failed);
+  container.classList.toggle('is-complete', completed);
+  if (status) status.textContent = completed ? '公开链接上传完成' : (failed ? '公开链接上传未完成' : '正在上传获取公开链接');
+  if (percent) percent.textContent = `${Math.round(value)}%`;
+  if (bar) bar.style.width = `${value}%`;
+  if (track) track.setAttribute('aria-valuenow', String(Math.round(value)));
+  if (message) message.textContent = job.uploadError || job.uploadMessage || '正在准备上传视频';
+}
+
+function renderSkippedSongs(job = {}) {
+  const container = document.getElementById('generatedSkippedSongs');
+  const title = document.getElementById('generatedSkippedSongsTitle');
+  const list = document.getElementById('generatedSkippedSongsList');
+  if (!container || !list) return;
+  const songs = Array.isArray(job.skippedSongs) ? job.skippedSongs : [];
+  container.hidden = songs.length === 0;
+  if (songs.length === 0) {
+    list.innerHTML = '';
+    return;
+  }
+  if (title) title.textContent = `已跳过 ${songs.length} 首不可播放歌曲`;
+  list.innerHTML = songs.map((song) => {
+    const index = Math.max(1, Number(song?.index) || 1);
+    const name = escapeHtml(song?.name || song?.id || '未知歌曲');
+    const reason = escapeHtml(song?.reason || '当前不可播放');
+    return `<li><span>${index}. ${name}</span><small>${reason}</small></li>`;
+  }).join('');
+}
+
+function updateGenerationProgress(job = {}) {
+  const progress = document.getElementById('generationProgress');
+  const status = document.getElementById('generationStatus');
+  const percent = document.getElementById('generationPercent');
+  const bar = document.getElementById('generationProgressBar');
+  const track = progress?.querySelector('.generation-progress-track');
+  const currentSong = document.getElementById('generationCurrentSong');
+  const count = document.getElementById('generationCount');
+  const elapsed = document.getElementById('generationElapsed');
+  const eta = document.getElementById('generationEta');
+  const cancelButton = document.getElementById('cancelGenerationBtn');
+  const value = Math.max(0, Math.min(100, Number(job.percent) || 0));
+
+  if (progress) {
+    progress.classList.toggle('is-complete', job.status === 'completed' || Boolean(job.localPath));
+    progress.classList.toggle('is-failed', job.status === 'failed');
+    progress.classList.toggle('is-cancelled', job.status === 'cancelled');
+  }
+  if (status) {
+    const baseStatus = job.message || (job.status === 'queued' ? '等待生成' : '正在生成视频');
+    const encoderStatus = job.encoder
+      ? ` · ${job.encoder}${job.gpu ? ' GPU' : ''}${job.concurrency > 1 ? ` · ${job.concurrency} 路并行` : ''}`
+      : '';
+    status.textContent = `${baseStatus}${encoderStatus}`;
+  }
+  if (percent) percent.textContent = `${Math.round(value)}%`;
+  if (bar) bar.style.width = `${value}%`;
+  if (track) track.setAttribute('aria-valuenow', String(Math.round(value)));
+  if (currentSong) currentSong.textContent = job.currentSong ? `当前：${job.currentSong}` : (job.message || '正在准备…');
+  if (count) {
+    const processed = Number.isFinite(Number(job.processed))
+      ? Number(job.processed)
+      : (Number(job.completed) || 0) + (Number(job.skipped) || 0);
+    count.textContent = `${processed} / ${Number(job.total) || 0}${Number(job.skipped) > 0 ? `（跳过 ${Number(job.skipped)}）` : ''}`;
+  }
+  if (elapsed) elapsed.textContent = formatGenerationDuration(job.elapsedSeconds);
+  if (eta) {
+    if (job.status === 'completed' || job.localPath) eta.textContent = '已完成';
+    else if (job.status === 'finalizing') eta.textContent = '正在合并…';
+    else if (job.status === 'failed' || job.status === 'cancelled') eta.textContent = '--';
+    else if (Number.isFinite(Number(job.etaSeconds))) eta.textContent = formatGenerationDuration(job.etaSeconds);
+    else eta.textContent = '计算中…';
+  }
+  if (job.cancelPath) activeGenerationCancelPath = String(job.cancelPath);
+  if (job.localPath) {
+    lastGeneratedLocalPath = String(job.localPath);
+  } else if (['queued', 'running', 'failed', 'cancelled'].includes(job.status)) {
+    lastGeneratedLocalPath = '';
+  }
+  renderGeneratedLocalPath(lastGeneratedLocalPath);
+  renderSkippedSongs(job);
+  updateUploadProgress(job);
+  const cancellable = Boolean(job.canCancel && activeGenerationCancelPath);
+  if (cancelButton) {
+    cancelButton.hidden = !cancellable;
+    cancelButton.disabled = generationCancelInFlight || job.status === 'cancelling';
+    cancelButton.textContent = job.status === 'cancelling' ? '正在取消…' : '取消生成';
+  }
+  if (['completed', 'failed', 'cancelled', 'upload_failed', 'uploading', 'resolving_link'].includes(job.status)) activeGenerationCancelPath = '';
+}
+
+async function requestGeneration(path, options = {}) {
+  const response = await fetch(path, {
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options
+  });
+  let payload;
+  try { payload = await response.json(); } catch (_) { payload = null; }
+  if (!response.ok || !payload?.success) {
+    throw new Error(payload?.message || payload?.error || `生成服务返回 ${response.status}`);
+  }
+  return payload.data;
+}
+
+function isActiveGenerationJob(job) {
+  return ['queued', 'running', 'finalizing', 'cancelling', 'uploading', 'resolving_link'].includes(job?.status);
+}
+
+function generationTaskStatus(job) {
+  const position = Math.max(0, Number(job.queuePosition) || 0);
+  const labels = {
+    running: '生成中',
+    finalizing: '正在合并',
+    cancelling: '正在取消',
+    uploading: '正在上传',
+    resolving_link: '正在获取直链',
+    completed: '已完成',
+    upload_failed: '本地已完成',
+    failed: '生成失败',
+    cancelled: '已取消'
+  };
+  if (job.status === 'queued') {
+    return position <= 1 ? '排队中 · 下一个开始' : `排队中 · 前面 ${position - 1} 个任务`;
+  }
+  return labels[job.status] || job.message || '等待中';
+}
+
+function generationTaskMeta(job) {
+  const quality = { low: '低音质', medium: '中音质', high: '高音质' }[job.quality] || '高音质';
+  const mode = job.mode === 'fast' ? '极速' : '标准';
+  const source = job.source === 'qq' ? 'QQ音乐' : '网易云';
+  if (job.taskType === 'upload_only') return `${source} · 仅上传本地视频`;
+  return `${source} · ${quality} · ${mode} · ${escapeHtml(job.resolution || '')} · ${Number(job.fps) || 1}FPS · ${Number(job.requestedConcurrency) || 4} 并发`;
+}
+
+function generationTaskOutput(job) {
+  const rows = [];
+  const localPath = String(job.localPath || '');
+  const publicUrl = escapeUrl(job.publicUrl || '');
+  if (localPath) {
+    rows.push(`
+      <div class="generation-task-output-row">
+        <span class="generation-task-output-label">本地路径</span>
+        <code title="${escapeHtml(localPath)}">${escapeHtml(localPath)}</code>
+        <button class="btn btn-ghost generation-task-copy" type="button" data-value="${escapeHtml(localPath)}" onclick="copyGenerationTaskValue(this)">复制</button>
+      </div>`);
+  }
+  if (publicUrl) {
+    rows.push(`
+      <div class="generation-task-output-row">
+        <span class="generation-task-output-label">公开直链</span>
+        <a href="${publicUrl}" target="_blank" rel="noopener noreferrer" title="${publicUrl}">${publicUrl}</a>
+        <button class="btn btn-ghost generation-task-copy" type="button" data-value="${publicUrl}" onclick="copyGenerationTaskValue(this)">复制</button>
+      </div>`);
+  }
+  if (job.uploadError && job.status === 'upload_failed') {
+    rows.push(`<div class="generation-task-current">公开链接：${escapeHtml(job.uploadError)}</div>`);
+  }
+  return rows.length ? `<div class="generation-task-output">${rows.join('')}</div>` : '';
+}
+
+function generationTaskSkippedSongs(job) {
+  const songs = Array.isArray(job.skippedSongs) ? job.skippedSongs : [];
+  if (songs.length === 0) return '';
+  const items = songs.map((song) =>
+    `<li><span>${Number(song.index) || '-'} · ${escapeHtml(song.name || song.id || '未知歌曲')}</span><small>${escapeHtml(song.reason || '当前不可播放')}</small></li>`
+  ).join('');
+  return `
+    <details class="generation-task-skipped">
+      <summary>已跳过 ${songs.length} 首不可播放歌曲</summary>
+      <ul>${items}</ul>
+    </details>`;
+}
+
+function renderGenerationJobs() {
+  const panel = document.getElementById('generationQueuePanel');
+  const container = document.getElementById('generationQueueList');
+  const summary = document.getElementById('generationQueueSummary');
+  if (!panel || !container || !summary) return;
+
+  const jobs = Array.from(generationJobs.values()).sort((left, right) => {
+    const leftActive = isActiveGenerationJob(left);
+    const rightActive = isActiveGenerationJob(right);
+    if (leftActive !== rightActive) return leftActive ? -1 : 1;
+    if (left.status === 'running' || left.status === 'finalizing' || left.status === 'uploading' || left.status === 'resolving_link') return -1;
+    if (right.status === 'running' || right.status === 'finalizing' || right.status === 'uploading' || right.status === 'resolving_link') return 1;
+    if (left.status === 'queued' && right.status === 'queued') return (Number(left.queuePosition) || 9999) - (Number(right.queuePosition) || 9999);
+    return (Number(right.createdAt) || 0) - (Number(left.createdAt) || 0);
+  });
+  panel.hidden = jobs.length === 0;
+  if (jobs.length === 0) {
+    container.innerHTML = '';
+    summary.textContent = '';
+    return;
+  }
+
+  const activeCount = jobs.filter(isActiveGenerationJob).length;
+  const queuedCount = jobs.filter((job) => job.status === 'queued').length;
+  summary.textContent = activeCount ? `${activeCount} 个进行中 · ${queuedCount} 个排队` : `最近 ${jobs.length} 个任务`;
+
+  container.innerHTML = jobs.map((job) => {
+    const percent = Math.max(0, Math.min(100, Number(job.percent) || 0));
+    const processed = Number.isFinite(Number(job.processed)) ? Number(job.processed) : Number(job.completed) || 0;
+    const total = Number(job.total) || 0;
+    const current = job.error || job.currentSong || job.uploadMessage || job.message || generationTaskStatus(job);
+    const eta = Number.isFinite(Number(job.etaSeconds)) ? formatGenerationDuration(job.etaSeconds) : '--';
+    const uploadText = ['uploading', 'resolving_link'].includes(job.status)
+      ? ` · 上传 ${Math.round(Number(job.uploadPercent) || 0)}%`
+      : '';
+    const cancelButton = job.canCancel
+      ? `<button class="btn generation-task-cancel" type="button" data-job-id="${escapeHtml(job.id)}" data-source="${escapeHtml(job.source)}" onclick="cancelGenerationJob(this)" ${generationJobCancelsInFlight.has(job.id) || job.status === 'cancelling' ? 'disabled' : ''}>${job.status === 'queued' ? '取消排队' : (job.status === 'cancelling' ? '正在取消…' : '取消任务')}</button>`
+      : '';
+    const confirmButton = job.canDismiss
+      ? `<button class="btn btn-ghost generation-task-confirm" type="button" data-job-id="${escapeHtml(job.id)}" data-source="${escapeHtml(job.source)}" onclick="confirmGenerationJob(this)">确认</button>`
+      : '';
+    const countText = job.taskType === 'upload_only'
+      ? `仅上传${['uploading', 'resolving_link'].includes(job.status) ? ` · ${Math.round(Number(job.uploadPercent) || 0)}%` : ''}`
+      : `${processed} / ${total}${Number(job.skipped) > 0 ? ` · 跳过 ${Number(job.skipped)}` : ''}${uploadText}`;
+    return `
+      <article class="generation-task-card is-${escapeHtml(job.status || 'queued')}">
+        <div class="generation-task-head">
+          <div class="generation-task-identity">
+            <img class="generation-task-cover" src="${imageSrc(job.playlistCover)}" alt="" referrerpolicy="no-referrer">
+            <div>
+              <div class="generation-task-title">${escapeHtml(job.playlistName || `歌单 ${job.playlistId || ''}`)}</div>
+              <div class="generation-task-meta">${escapeHtml(job.playlistCreator || '未知作者')}</div>
+              <div class="generation-task-meta">${generationTaskMeta(job)}</div>
+            </div>
+          </div>
+          <span class="generation-task-status">${escapeHtml(generationTaskStatus(job))}</span>
+        </div>
+        <div class="generation-task-status-row">
+          <span>${countText}</span>
+          <strong class="generation-task-percent">${Math.round(percent)}%</strong>
+        </div>
+        <div class="generation-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(percent)}">
+          <div class="generation-progress-bar" style="width:${percent}%"></div>
+        </div>
+        <div class="generation-task-current" title="${escapeHtml(current)}">${escapeHtml(current)}</div>
+        <div class="generation-task-footer">
+          <div class="generation-task-timing"><span>已用 ${formatGenerationDuration(job.elapsedSeconds)}</span><span>预计还需 ${isActiveGenerationJob(job) ? eta : '--'}</span></div>
+          <div class="generation-task-actions">${cancelButton}${confirmButton}</div>
+        </div>
+        ${generationTaskSkippedSongs(job)}
+        ${generationTaskOutput(job)}
+      </article>`;
+  }).join('');
+}
+
+async function copyGenerationTaskValue(button) {
+  const value = String(button?.dataset?.value || '');
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast('复制成功');
+  } catch (_) {
+    fallbackCopyText(value);
+  }
+}
+
+async function cancelGenerationJob(button) {
+  const jobId = String(button?.dataset?.jobId || '');
+  const source = button?.dataset?.source === 'qq' ? 'qq' : 'netease';
+  if (!jobId || generationJobCancelsInFlight.has(jobId)) return;
+  generationJobCancelsInFlight.add(jobId);
+  renderGenerationJobs();
+  try {
+    const callApi = source === 'qq' ? qqApi : api;
+    const response = await callApi(`/playlist-video/generation-jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST', body: '{}' }, 'GENERATION_JOB_CANCEL');
+    if (!response.success) throw new Error(response.message || '取消任务失败');
+    const job = response.data;
+    generationJobs.set(`${job.source}:${job.id}`, job);
+    renderGenerationJobs();
+    showToast(job.status === 'cancelled' ? '已取消排队任务' : '正在取消生成任务');
+  } catch (error) {
+    showToast(error?.message || '取消任务失败', 'error');
+  } finally {
+    generationJobCancelsInFlight.delete(jobId);
+    loadGenerationJobs();
+  }
+}
+
+async function confirmGenerationJob(button) {
+  const jobId = String(button?.dataset?.jobId || '');
+  const source = button?.dataset?.source === 'qq' ? 'qq' : 'netease';
+  if (!jobId) return;
+  button.disabled = true;
+  button.textContent = '确认中…';
+  const callApi = source === 'qq' ? qqApi : api;
+  const response = await callApi(`/playlist-video/generation-jobs/${encodeURIComponent(jobId)}/dismiss`, { method: 'POST', body: '{}' }, 'GENERATION_JOB_DISMISS');
+  if (!response.success) {
+    button.disabled = false;
+    button.textContent = '确认';
+    return showActionError(response, '确认任务失败');
+  }
+  generationJobs.delete(`${source}:${jobId}`);
+  renderGenerationJobs();
+}
+
+async function loadGenerationJobs() {
+  if (generationJobsPollInFlight) return;
+  generationJobsPollInFlight = true;
+  try {
+    const requests = [];
+    if (token) requests.push(api('/playlist-video/generation-jobs', {}, 'GENERATION_JOBS'));
+    if (qqToken) requests.push(qqApi('/playlist-video/generation-jobs', {}, 'QQ_GENERATION_JOBS'));
+    const responses = await Promise.all(requests);
+    const nextJobs = new Map();
+    for (const response of responses) {
+      if (!response?.success || !Array.isArray(response.data?.jobs)) continue;
+      for (const job of response.data.jobs) nextJobs.set(`${job.source}:${job.id}`, job);
+    }
+    generationJobs.clear();
+    for (const [key, job] of nextJobs) generationJobs.set(key, job);
+    renderGenerationJobs();
+  } finally {
+    generationJobsPollInFlight = false;
+    if (resolveViewFromPath(window.location.pathname) === 'home') {
+      const hasActive = Array.from(generationJobs.values()).some(isActiveGenerationJob);
+      generationJobsPollTimer = setTimeout(loadGenerationJobs, hasActive ? 1000 : 5000);
+    }
+  }
+}
+
+function startGenerationJobsPolling() {
+  stopGenerationJobsPolling();
+  loadGenerationJobs();
+}
+
+function stopGenerationJobsPolling() {
+  if (generationJobsPollTimer) clearTimeout(generationJobsPollTimer);
+  generationJobsPollTimer = null;
+}
+
+function waitForGenerationPoll() {
+  return new Promise((resolve) => setTimeout(resolve, 1000));
+}
+
+async function generateEntirePlaylist(generationPath, requestSequence, button) {
+  let job = await requestGeneration(generationPath, { method: 'POST', body: '{}' });
+  updateGenerationProgress(job);
+  while (['queued', 'running', 'finalizing', 'cancelling', 'uploading', 'resolving_link'].includes(job.status)) {
+    if (requestSequence !== generationRequestSequence) throw new Error('生成任务已取消显示');
+    button.innerHTML = ['uploading', 'resolving_link'].includes(job.status)
+      ? `上传中 ${Math.round(Number(job.uploadPercent) || 0)}%`
+      : `生成中 ${Math.round(Number(job.percent) || 0)}%`;
+    await waitForGenerationPoll();
+    job = await requestGeneration(job.statusPath);
+    updateGenerationProgress(job);
+  }
+  if (job.status === 'cancelled') {
+    const error = new Error('生成已取消');
+    error.code = 'GENERATION_CANCELLED';
+    error.job = job;
+    throw error;
+  }
+  if (job.status === 'upload_failed' && job.localPath) return job;
+  if (job.status !== 'completed') throw new Error(job.error || '整张歌单生成失败');
+  return job;
+}
+
+function syncGenerationOptionAvailability() {
+  const fastMode = document.querySelector('input[name="generationMode"]:checked')?.value === 'fast';
+  const fpsGroup = document.querySelector('.generation-fps');
+  const fpsInputs = document.querySelectorAll('input[name="generationFps"]');
+  const notice = document.getElementById('fastFpsNotice');
+  fpsInputs.forEach((input) => { input.disabled = fastMode; });
+  if (fpsGroup) fpsGroup.classList.toggle('is-fast-locked', fastMode);
+  if (notice) notice.hidden = !fastMode;
+}
+
+function confirmHighConcurrencySelection(input) {
+  if (!input?.checked) return;
+  const nextConcurrency = Number(input.value);
+  if (![8, 16].includes(nextConcurrency) || localStorage.getItem(HIGH_CONCURRENCY_WARNING_KEY) === '1') {
+    lastGenerationConcurrency = nextConcurrency;
+    return;
+  }
+  const accepted = window.confirm(
+    `${nextConcurrency} 并发会明显增加 CPU、显存、内存和网络压力，可能导致生成不稳定或失败。是否继续？`
+  );
+  if (accepted) {
+    localStorage.setItem(HIGH_CONCURRENCY_WARNING_KEY, '1');
+    lastGenerationConcurrency = nextConcurrency;
+    return;
+  }
+  const fallback = document.querySelector(`input[name="generationConcurrency"][value="${lastGenerationConcurrency}"]`)
+    || document.querySelector('input[name="generationConcurrency"][value="4"]');
+  if (fallback) fallback.checked = true;
+}
+
+async function cancelGeneration() {
+  if (!activeGenerationCancelPath || generationCancelInFlight) return;
+  generationCancelInFlight = true;
+  const button = document.getElementById('cancelGenerationBtn');
+  if (button) {
+    button.disabled = true;
+    button.textContent = '正在取消…';
+  }
+  try {
+    const job = await requestGeneration(activeGenerationCancelPath, { method: 'POST', body: '{}' });
+    updateGenerationProgress(job);
+    showToast('正在取消生成，已完成的歌曲会保留');
+  } catch (error) {
+    showToast(error?.message || '取消生成失败', 'error');
+  } finally {
+    generationCancelInFlight = false;
+    if (button && !button.hidden && button.textContent !== '正在取消…') button.disabled = false;
+  }
+}
+
 async function generatePlaylist() {
   if (currentPlatform === 'qq') {
     if (!qqToken) return showToast('请先登录QQ音乐', 'error');
@@ -1258,6 +2073,25 @@ async function generatePlaylist() {
   try {
     const isQQ = currentPlatform === 'qq';
     const callApi = isQQ ? qqApi : api;
+    const generationOrder = document.querySelector('input[name="generationOrder"]:checked')?.value === 'shuffle'
+      ? 'shuffle'
+      : 'sequential';
+    const generationMode = document.querySelector('input[name="generationMode"]:checked')?.value === 'fast'
+      ? 'fast'
+      : '';
+    const generationQualityValue = document.querySelector('input[name="generationQuality"]:checked')?.value;
+    const generationQuality = ['low', 'medium', 'high'].includes(generationQualityValue)
+      ? generationQualityValue
+      : 'high';
+    const generationResolution = document.querySelector('input[name="generationResolution"]:checked')?.value === '1920x1080'
+      ? '1920x1080'
+      : '1600x900';
+    const requestedFps = Number(document.querySelector('input[name="generationFps"]:checked')?.value);
+    const generationFps = generationMode === 'fast'
+      ? 1
+      : ([5, 10, 15, 30].includes(requestedFps) ? requestedFps : 15);
+    const requestedConcurrency = Number(document.querySelector('input[name="generationConcurrency"]:checked')?.value);
+    const generationConcurrency = [2, 4, 6, 8, 16].includes(requestedConcurrency) ? requestedConcurrency : 4;
     const parseScope = isQQ ? 'QQ_PLAYLIST_PARSE' : 'PLAYLIST_PARSE';
     const urlScope = isQQ ? 'QQ_PLAYLIST_URL' : 'PLAYLIST_URL';
     const parseRes = await callApi('/playlist/parse?url=' + encodeURIComponent(input), {}, parseScope);
@@ -1269,26 +2103,38 @@ async function generatePlaylist() {
     currentPlaylist = parseRes.data;
     currentPlaylist._platform = currentPlatform;
 
-    const urlRes = await callApi('/playlist/url?id=' + currentPlaylist.id, {}, urlScope);
+    const urlRes = await callApi(
+      '/playlist/url?id=' + currentPlaylist.id + '&order=' + generationOrder +
+        (generationMode ? '&mode=' + generationMode : '') +
+        '&quality=' + generationQuality +
+        '&resolution=' + generationResolution + '&fps=' + generationFps +
+        '&concurrency=' + generationConcurrency,
+      {},
+      urlScope
+    );
     if (!urlRes.success) {
       showActionError(urlRes, '生成链接失败');
       return;
     }
     
-    document.getElementById('playlistCover').src = imageSrc(currentPlaylist.cover);
-    document.getElementById('playlistName').textContent = currentPlaylist.name;
-    document.getElementById('playlistMeta').textContent = `共 ${currentPlaylist.songCount} 首`;
-    lastGeneratedUrls = (urlRes.data && Array.isArray(urlRes.data.urls)) ? urlRes.data.urls : [];
-    if (!lastGeneratedUrls.length && urlRes.data && urlRes.data.url) {
-      lastGeneratedUrls = [{ type: 'hls', label: 'HLS', url: String(urlRes.data.url) }];
-    }
-    selectedGeneratedUrlType = (urlRes.data && urlRes.data.default) ? String(urlRes.data.default) : (lastGeneratedUrls[0]?.type || 'hls');
-    lastGeneratedUrl = getSelectedGeneratedUrl();
-    renderGeneratedUrlOptions();
-    document.getElementById('resultSection').classList.add('show');
-    
-    updateFavoriteBtn();
-    
+    if (!urlRes.data?.generationPath) throw new Error('服务端未返回整单生成地址');
+    const job = await requestGeneration(urlRes.data.generationPath, {
+      method: 'POST',
+      body: JSON.stringify({
+        playlistName: currentPlaylist.name || '',
+        playlistCover: currentPlaylist.cover || '',
+        playlistCreator: currentPlaylist.creator || '',
+        songCount: Number(currentPlaylist.songCount) || 0
+      })
+    });
+    generationJobs.set(`${job.source}:${job.id}`, job);
+    renderGenerationJobs();
+    startGenerationJobsPolling();
+    const position = Math.max(0, Number(job.queuePosition) || 0);
+    showToast(job.status === 'queued' && position > 1
+      ? `已加入生成队列，前面还有 ${position - 1} 个任务`
+      : '任务已加入生成队列');
+
   } catch (e) {
     showActionError(normalizeRuntimeError('PLAYLIST_GENERATE', e, '/ui/generatePlaylist'), '获取歌单失败');
   } finally {
@@ -1313,6 +2159,19 @@ function copyUrl() {
     // 非 HTTPS 环境下 Clipboard API 不可用，使用兼容方案
     fallbackCopyText(url);
   }
+}
+
+function openGeneratedUrl() {
+  const url = getSelectedGeneratedUrl();
+  if (!url) return showToast('暂无可打开的链接', 'error');
+
+  const link = document.createElement('a');
+  link.href = url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 function fallbackCopyText(text) {

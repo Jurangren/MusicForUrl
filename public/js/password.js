@@ -1,180 +1,102 @@
 (function initThemeFromStorage() {
   const savedTheme = localStorage.getItem('theme');
-  if (savedTheme === 'dark') {
-    document.documentElement.setAttribute('data-theme', 'dark');
-  }
+  if (savedTheme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
 })();
 
-const MFU_ERROR = (typeof window !== 'undefined' && window.MfuError) ? window.MfuError : null;
+let setupMode = false;
+let minSecretLength = 8;
 
-function normalizePasswordError(scope, error, requestPath) {
-  if (error && typeof error === 'object' && error.success === false && error.errorCode) {
-    return error;
-  }
-
-  if (MFU_ERROR && typeof MFU_ERROR.normalizeCaughtError === 'function') {
-    return MFU_ERROR.normalizeCaughtError({ scope, error, requestPath });
-  }
-
-  return {
-    success: false,
-    message: (error && error.message) ? String(error.message) : '请求失败，请稍后重试',
-    errorCode: `E-FE-${String(scope || 'UNKNOWN').toUpperCase()}-UNKNOWN`,
-    _errorMeta: {
-      kind: 'FE',
-      scope: String(scope || 'UNKNOWN').toUpperCase(),
-      status: null,
-      requestPath: requestPath || '',
-      rawMessage: (error && error.message) ? String(error.message) : ''
-    }
-  };
+function byId(id) {
+  return document.getElementById(id);
 }
 
-function toPasswordDisplayMessage(errorLike, fallback) {
-  if (MFU_ERROR && typeof MFU_ERROR.toDisplayMessage === 'function') {
-    return MFU_ERROR.toDisplayMessage(errorLike, fallback);
-  }
-  return String((errorLike && errorLike.message) || fallback || '请求失败，请稍后重试');
+function showError(message) {
+  const el = byId('errorMessage');
+  if (!el) return;
+  el.textContent = String(message || '请求失败，请稍后重试');
+  el.classList.add('show');
 }
 
-function logPasswordDebug(meta) {
-  if (MFU_ERROR && typeof MFU_ERROR.logDebug === 'function') {
-    MFU_ERROR.logDebug(meta);
-    return;
-  }
-  console.error('[MFU_ERROR]', meta);
+function clearError() {
+  const el = byId('errorMessage');
+  if (el) el.classList.remove('show');
 }
 
-function showPasswordError(errorMessageEl, errorLike, fallback) {
-  if (!errorMessageEl) return;
-  errorMessageEl.textContent = toPasswordDisplayMessage(errorLike, fallback);
-  errorMessageEl.classList.add('show');
+function setMode(configured) {
+  setupMode = !configured;
+  byId('passwordModeBadge').textContent = setupMode ? '首次配置' : '安全访问';
+  byId('passwordTitle').textContent = setupMode ? '设置后台密钥' : '后台密钥登录';
+  byId('passwordDesc').textContent = setupMode
+    ? '首次使用需要创建一个后台访问密钥。设置完成后才能进入管理界面。'
+    : '后台已锁定，请输入密钥后继续访问。';
+  byId('passwordInput').placeholder = setupMode ? `创建密钥（至少 ${minSecretLength} 位）` : '请输入后台密钥';
+  byId('passwordInput').autocomplete = setupMode ? 'new-password' : 'current-password';
+  byId('passwordConfirmInput').hidden = !setupMode;
+  byId('passwordHint').hidden = !setupMode;
+  byId('passwordSubmit').textContent = setupMode ? '设置并进入后台' : '登录后台';
 }
 
-async function submitPassword(password, currentPath) {
-  let response;
+async function loadStatus() {
   try {
-    response = await fetch(currentPath, {
-      headers: {
-        'X-Site-Password': password
-      }
-    });
-  } catch (error) {
-    const normalized = normalizePasswordError('SITE_PASSWORD_VERIFY', error, currentPath);
-    logPasswordDebug({
-      channel: 'password',
-      requestPath: currentPath,
-      errorCode: normalized.errorCode,
-      meta: normalized._errorMeta
-    });
-    return normalized;
+    const response = await fetch('/api/site-access/status', { credentials: 'same-origin' });
+    const payload = await response.json();
+    if (payload.authenticated) {
+      window.location.replace('/');
+      return;
+    }
+    minSecretLength = Number(payload.minSecretLength) || 8;
+    setMode(Boolean(payload.configured));
+  } catch (_) {
+    showError('无法读取后台安全状态，请刷新重试');
   }
-
-  if (response.ok) {
-    return { success: true };
-  }
-
-  let payload = null;
-  try {
-    payload = await response.json();
-  } catch (error) {
-    const parseError = Object.assign(new Error(error && error.message ? error.message : 'response parse error'), {
-      __mfuType: 'PARSE',
-      __mfuStatus: response.status
-    });
-    const normalized = normalizePasswordError('SITE_PASSWORD_VERIFY', parseError, currentPath);
-    logPasswordDebug({
-      channel: 'password',
-      requestPath: currentPath,
-      errorCode: normalized.errorCode,
-      meta: normalized._errorMeta
-    });
-    return normalized;
-  }
-
-  let normalized;
-  if (MFU_ERROR && typeof MFU_ERROR.normalizeHttpError === 'function') {
-    normalized = MFU_ERROR.normalizeHttpError({
-      scope: 'SITE_PASSWORD_VERIFY',
-      status: response.status,
-      payload,
-      requestPath: currentPath
-    });
-  } else {
-    normalized = {
-      success: false,
-      message: '密码错误，请重试',
-      errorCode: `E-HTTP-SITE_PASSWORD_VERIFY-${response.status}`,
-      _errorMeta: {
-        kind: 'HTTP',
-        scope: 'SITE_PASSWORD_VERIFY',
-        status: response.status,
-        requestPath: currentPath,
-        rawMessage: payload && payload.message ? payload.message : ''
-      }
-    };
-  }
-
-  if (response.status === 401) {
-    normalized.message = '密码错误，请重试';
-  }
-
-  logPasswordDebug({
-    channel: 'password',
-    requestPath: currentPath,
-    errorCode: normalized.errorCode,
-    meta: normalized._errorMeta
-  });
-  return normalized;
 }
 
-function handleSubmit(e) {
-  e.preventDefault();
+async function handleSubmit(event) {
+  event.preventDefault();
+  clearError();
 
-  const passwordInput = document.getElementById('passwordInput');
-  const errorMessage = document.getElementById('errorMessage');
-  const password = passwordInput ? passwordInput.value : '';
-
-  if (!password) {
-    if (errorMessage) {
-      errorMessage.textContent = '请输入密码';
-      errorMessage.classList.add('show');
-    }
+  const secret = byId('passwordInput').value;
+  const confirmation = byId('passwordConfirmInput').value;
+  if (!secret) {
+    showError(setupMode ? '请输入要设置的后台密钥' : '请输入后台密钥');
+    return false;
+  }
+  if (setupMode && secret.length < minSecretLength) {
+    showError(`后台密钥至少需要 ${minSecretLength} 个字符`);
+    return false;
+  }
+  if (setupMode && secret !== confirmation) {
+    showError('两次输入的后台密钥不一致');
     return false;
   }
 
-  if (errorMessage) {
-    errorMessage.classList.remove('show');
-  }
+  const button = byId('passwordSubmit');
+  button.disabled = true;
+  button.textContent = setupMode ? '正在安全设置…' : '正在验证…';
 
-  sessionStorage.setItem('sitePassword', password);
-  const currentPath = window.location.pathname + window.location.search;
-
-  submitPassword(password, currentPath)
-    .then((result) => {
-      if (result && result.success) {
-        window.location.reload();
-        return;
-      }
-
-      showPasswordError(errorMessage, result, '密码验证失败，请重试');
-      if (passwordInput) {
-        passwordInput.value = '';
-        passwordInput.focus();
-      }
+  try {
+    const endpoint = setupMode ? '/api/site-access/setup' : '/api/site-access/login';
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret })
     });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || '密钥验证失败');
+    sessionStorage.removeItem('sitePassword');
+    window.location.replace('/');
+  } catch (error) {
+    showError(error?.message || '请求失败，请稍后重试');
+    byId('passwordInput').focus();
+    if (!setupMode) byId('passwordInput').value = '';
+  } finally {
+    button.disabled = false;
+    button.textContent = setupMode ? '设置并进入后台' : '登录后台';
+  }
 
   return false;
 }
 
-(function attachSitePasswordHeader() {
-  const savedPassword = sessionStorage.getItem('sitePassword');
-  if (savedPassword) {
-    const originalFetch = window.fetch;
-    window.fetch = function patchedFetch(url, options = {}) {
-      options.headers = options.headers || {};
-      options.headers['X-Site-Password'] = savedPassword;
-      return originalFetch(url, options);
-    };
-  }
-})();
+window.handleSubmit = handleSubmit;
+loadStatus();

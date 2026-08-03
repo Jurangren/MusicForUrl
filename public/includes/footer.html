@@ -97,11 +97,45 @@
       <div class="about-content">
         <p>一个简单、纯净的工具，用于将网易云音乐/QQ音乐歌单转换为 VRChat 可播放的链接。</p>
         <p><strong>功能特点：</strong></p>
-        <p>• 支持网易云音乐和QQ音乐双平台<br>• 解析歌单并生成 m3u8 链接<br>• 支持账号登录与收藏夹同步<br>• 自动记录最近播放历史</p>
+        <p>• 支持网易云音乐和QQ音乐双平台<br>• 解析歌单并生成整单 MP4 直链<br>• 支持账号登录与收藏夹同步<br>• 自动记录最近播放历史</p>
         <p>项目开源于 GitHub。</p>
       </div>
       <div class="modal-actions">
         <button class="btn btn-primary" style="width: 100%;" onclick="hideAbout()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TMPLINK Token Help Modal -->
+  <div class="modal-overlay" id="tmplinkHelpModal">
+    <div class="modal tmplink-help-modal" role="dialog" aria-modal="true" aria-labelledby="tmplinkHelpTitle">
+      <div class="modal-title" id="tmplinkHelpTitle">怎么获取 TMPLINK Token？</div>
+      <div class="tmplink-help-content">
+        <p><strong>TMPLINK 是什么？</strong></p>
+        <p>TMPLINK 是第三方临时文件存储与分享平台。MusicForUrl 借助它上传生成的视频并获取可公开访问的直链。当前上传使用约 7 天有效期，实际可用时间及服务状态以 TMPLINK 平台为准。</p>
+        <ol class="tmplink-help-steps">
+          <li>
+            <strong>登录 TMPLINK</strong>
+            <span>打开 <a href="https://www.ttttt.link" target="_blank" rel="noopener noreferrer">TMPLINK 官网</a>，按页面提示注册或登录账号。</span>
+          </li>
+          <li>
+            <strong>打开浏览器开发者工具</strong>
+            <span>登录成功后按 <code>F12</code>，选择“应用（Application）”；如果没看到该标签，可在顶部的 <code>»</code> 菜单中寻找。</span>
+          </li>
+          <li>
+            <strong>复制 app_token</strong>
+            <span>依次展开“本地存储（Local Storage）”和 <code>https://www.ttttt.link</code>，找到键名 <code>app_token</code>，复制它对应的 Value。</span>
+          </li>
+          <li>
+            <strong>粘贴并验证</strong>
+            <span>回到本页面，将完整 Token 粘贴到输入框，点击“验证并保存”。只有通过 TMPLINK 服务器验证后才会加密保存。</span>
+          </li>
+        </ol>
+        <div class="tmplink-help-warning"><strong>安全提醒：</strong>Token 相当于账号凭证，请勿截图、转发或提交到 Git；如果怀疑泄露，请立即退出 TMPLINK 登录并重新获取。</div>
+      </div>
+      <div class="modal-actions">
+        <a class="btn btn-ghost" href="https://www.ttttt.link" target="_blank" rel="noopener noreferrer">打开 TMPLINK</a>
+        <button class="btn btn-primary" type="button" onclick="hideTmplinkHelp()">我知道了</button>
       </div>
     </div>
   </div>

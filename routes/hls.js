@@ -6,12 +6,32 @@ const fs = require('fs');
 const os = require('os');
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 const netease = require('../lib/netease');
 const qqmusic = require('../lib/qqmusic');
 const { decrypt } = require('../lib/crypto');
-const { userOps, qqUserOps, playlistOps, playLogOps } = require('../lib/db');
+const { userOps, qqUserOps, playlistOps, playLogOps, uploadCredentialOps, generationHistoryOps } = require('../lib/db');
+const { TmpLinkClient } = require('../lib/tmplink');
 const { verifyPlaybackToken, isLegacyToken } = require('../lib/playback-token');
 const { getOrBindBg } = require('../lib/lite-video-bg');
+const { createTextAssets, removeTextAssets, buildVisualFilter } = require('../lib/video-visual');
+const { createLyricsAss } = require('../lib/lyrics');
+const { detectVideoEncoder } = require('../lib/video-encoder');
+const {
+  sanitizeOutputFileStem,
+  playlistOutputIdentity,
+  buildPlaylistOutputFilename,
+  buildPlaylistOutputSuffix
+} = require('../lib/output-filename');
+const { estimateGenerationTiming } = require('../lib/generation-estimate');
+const { SerialJobQueue } = require('../lib/serial-job-queue');
+const {
+  resolveGenerationProfile,
+  normalizeGenerationResolution,
+  normalizeGenerationFps,
+  normalizeGenerationQuality,
+  getGenerationAudioBitrate
+} = require('../lib/generation-profile');
 
 function isValidNumericId(id) {
   return typeof id === 'string' && /^\d+$/.test(id) && id.length <= 20;
@@ -36,18 +56,48 @@ function resolveUserFromAccessToken(token, playlistId, source = 'netease') {
 
 function getSourceFromReq(req) {
   const base = String(req.baseUrl || '');
-  if (base.startsWith('/api/qq/hls')) return 'qq';
+  if (base.startsWith('/api/qq/hls') || base.startsWith('/api/qq/playlist-video')) return 'qq';
   return 'netease';
 }
 
-function getModeFromReq(req) {
-  const mode = String(req.query.mode || '').trim().toLowerCase();
-  if (mode === 'lite_video') return 'lite_video';
-  return '';
+function getRenderProfileFromReq(req) {
+  const query = { ...(req.query || {}) };
+  if (query.concurrency == null && process.env.PLAYLIST_GENERATION_CONCURRENCY) {
+    query.concurrency = process.env.PLAYLIST_GENERATION_CONCURRENCY;
+  }
+  return resolveGenerationProfile(query, { allowLiteVideo: true });
+}
+
+function getPlaybackOrderFromReq(req) {
+  const value = String(req.query?.order || req.body?.order || '').trim().toLowerCase();
+  return value === 'shuffle' ? 'shuffle' : 'sequential';
+}
+
+function shuffleTracks(tracks) {
+  const result = Array.isArray(tracks) ? tracks.slice() : [];
+  for (let index = result.length - 1; index > 0; index--) {
+    const picked = crypto.randomInt(index + 1);
+    [result[index], result[picked]] = [result[picked], result[index]];
+  }
+  return result;
 }
 
 function isLiteVideoMode(mode) {
   return mode === 'lite_video';
+}
+
+function isFastGenerationMode(mode) {
+  return mode === 'fast';
+}
+
+function getRenderQuerySuffix(mode, quality, resolution, fps) {
+  const profile = resolveGenerationProfile({ mode, quality, resolution, fps }, { allowLiteVideo: true });
+  const params = new URLSearchParams();
+  if (profile.mode) params.set('mode', profile.mode);
+  params.set('quality', profile.quality);
+  params.set('resolution', profile.resolution);
+  params.set('fps', String(profile.fps));
+  return `?${params.toString()}`;
 }
 
 function getPlaylistCacheKey(playlistId, source) {
@@ -71,11 +121,48 @@ function isValidSongIdForSource(songId, source) {
   return isValidNumericId(raw);
 }
 
-function getScopedSongCacheKey(songId, source, mode) {
+function getScopedSongCacheKey(songId, source, mode, quality, resolution, fps, renderContext = null) {
   const sid = String(songId || '').trim();
   const src = source === 'qq' ? 'qq' : 'netease';
-  const modeKey = isLiteVideoMode(mode) ? 'lite_video' : 'default';
-  return `${src}:${modeKey}:${sid}`;
+  const profile = resolveGenerationProfile({ mode, quality, resolution, fps }, { allowLiteVideo: true });
+  const modeKey = isFastGenerationMode(profile.mode) ? 'fast' : (isLiteVideoMode(profile.mode) ? 'lite_video' : 'default');
+  const base = `${src}:${modeKey}:${profile.quality}:${profile.resolution}:${profile.fps}fps:${sid}`;
+  if (!renderContext || !renderContext.playlistId) return base;
+  const identity = JSON.stringify({
+    playlistId: String(renderContext.playlistId),
+    order: renderContext.order === 'shuffle' ? 'shuffle' : 'sequential',
+    currentIndex: Math.max(1, Number(renderContext.currentIndex) || 1),
+    totalTracks: Math.max(1, Number(renderContext.totalTracks) || 1),
+    collectionName: String(renderContext.collectionName || ''),
+    collectionCreator: String(renderContext.collectionCreator || '')
+  });
+  const contextHash = crypto.createHash('sha1').update(identity).digest('hex').slice(0, 12);
+  return `${base}:ctx${contextHash}`;
+}
+
+function createSongRenderContext(job, currentIndex, totalTracks) {
+  const total = Math.max(1, Number(totalTracks) || 1);
+  return {
+    playlistId: String(job.playlistId || ''),
+    order: job.order === 'shuffle' ? 'shuffle' : 'sequential',
+    collectionType: job.collectionType === 'album' ? 'album' : 'playlist',
+    collectionName: String(job.playlistName || ''),
+    collectionCreator: String(job.playlistCreator || ''),
+    currentIndex: Math.max(1, Number(currentIndex) || 1),
+    totalTracks: total,
+    showCollection: total > 1
+  };
+}
+
+function getProfileFromSongCacheKey(songCacheKey) {
+  const parts = String(songCacheKey || '').split(':');
+  const mode = parts[1] === 'fast' ? 'fast' : (parts[1] === 'lite_video' ? 'lite_video' : '');
+  return resolveGenerationProfile({
+    mode,
+    quality: normalizeGenerationQuality(parts[2]),
+    resolution: normalizeGenerationResolution(parts[3]),
+    fps: normalizeGenerationFps(String(parts[4] || '').replace(/fps$/i, ''), mode)
+  }, { allowLiteVideo: true });
 }
 
 function getSegmentBasePathForReq(req, token, playlistId) {
@@ -90,7 +177,8 @@ function getSourceAdapter(source) {
   if (source === 'qq') {
     return {
       source: 'qq',
-      getSongUrl: (songId, cookie) => qqmusic.getSongUrl(String(songId), cookie),
+      getSongUrl: (songId, cookie, quality) => qqmusic.getSongUrl(String(songId), cookie, quality),
+      getLyrics: (songId, cookie) => qqmusic.getLyrics(String(songId), cookie),
       getPlaylistDetail: (playlistId, cookie) => qqmusic.getPlaylistDetail(String(playlistId), cookie),
       toPlayLogPlaylistId: (playlistId) => `qq:${String(playlistId)}`,
       toPlayLogSongId: (songId) => `qq:${String(songId)}`
@@ -98,11 +186,54 @@ function getSourceAdapter(source) {
   }
   return {
     source: 'netease',
-    getSongUrl: (songId, cookie) => netease.getSongUrl(String(songId), cookie),
+    getSongUrl: (songId, cookie, quality) => netease.getSongUrl(String(songId), cookie, quality),
+    getLyrics: (songId, cookie) => netease.getLyrics(String(songId), cookie),
     getPlaylistDetail: (playlistId, cookie) => netease.getPlaylistDetail(String(playlistId), cookie),
     toPlayLogPlaylistId: (playlistId) => String(playlistId),
     toPlayLogSongId: (songId) => String(songId)
   };
+}
+
+function cachePlaylistDetail(playlistId, source, playlist) {
+  if (!playlist) return;
+  const ttlSec = parseInt(process.env.CACHE_TTL, 10) || 86400;
+  const expiresAt = new Date(Date.now() + ttlSec * 1000).toISOString().slice(0, 19).replace('T', ' ');
+  const playlistName = String(playlist.name || '');
+  const playlistCreator = String(playlist.creator || '');
+  const tracks = Array.isArray(playlist.tracks)
+    ? playlist.tracks.map((track) => ({
+        ...track,
+        _collectionName: playlistName,
+        _collectionCreator: playlistCreator
+      }))
+    : [];
+  playlistOps.set.run({
+    playlist_id: getPlaylistCacheKey(playlistId, source),
+    name: playlistName,
+    cover: playlist.cover || '',
+    song_count: playlist.songCount || tracks.length || 0,
+    songs: JSON.stringify(tracks),
+    expires_at: expiresAt
+  });
+}
+
+function readCachedPlaylistDetail(playlistId, source) {
+  const cached = playlistOps.get.get(getPlaylistCacheKey(playlistId, source));
+  if (!cached) return null;
+  try {
+    const tracks = JSON.parse(cached.songs || '[]');
+    if (!Array.isArray(tracks) || tracks.length === 0) return null;
+    return {
+      id: String(playlistId),
+      name: cached.name || '',
+      cover: cached.cover || '',
+      creator: tracks[0]?._collectionCreator || '',
+      songCount: Number(cached.song_count) || tracks.length,
+      tracks
+    };
+  } catch (_) {
+    return null;
+  }
 }
 
 function isValidSegmentIndex(index) {
@@ -193,15 +324,15 @@ const CACHE_CONFIG = {
 
 const LOG_VERBOSE = process.env.LOG_HLS_VERBOSE === '1' || process.env.LOG_HLS_VERBOSE === 'true';
 
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 25;
 
 const DEFAULT_COVER_URL =
   process.env.DEFAULT_COVER_URL ||
   'https://p1.music.126.net/6y-UleORITEDbvrOLV0Q8A==/5639395138885805.jpg';
 
 const COVER_OUTPUT = {
-  width: parseInt(process.env.COVER_WIDTH) || 1920,
-  height: parseInt(process.env.COVER_HEIGHT) || 1080
+  width: Math.max(640, parseInt(process.env.COVER_WIDTH, 10) || 1920),
+  height: Math.max(360, parseInt(process.env.COVER_HEIGHT, 10) || 1080)
 };
 
 const COVER_FPS = (() => {
@@ -211,6 +342,11 @@ const COVER_FPS = (() => {
   if (Number.isFinite(n) && n >= 1 && n <= 30) return n;
   return 5;
 })();
+
+const VIDEO_VISUAL_FPS = Math.max(
+  5,
+  Math.min(30, parseInt(process.env.VIDEO_VISUAL_FPS, 10) || COVER_FPS)
+);
 
 const HLS_FFMPEG_THREADS = (() => {
   const raw = process.env.HLS_FFMPEG_THREADS;
@@ -240,7 +376,7 @@ function pickCoverUrlForSong(song, playlistCoverUrl) {
 }
 
 const JOB_LIMITS = {
-  maxConcurrentJobs: parseInt(process.env.HLS_MAX_CONCURRENT_JOBS) || 4,
+  maxConcurrentJobs: Math.max(1, Math.min(16, parseInt(process.env.HLS_MAX_CONCURRENT_JOBS, 10) || 16)),
   maxQueueSize: parseInt(process.env.HLS_MAX_QUEUE) || 20,
   downloadTimeout: parseInt(process.env.HLS_DOWNLOAD_TIMEOUT) || 60000,
   downloadMaxSize: parseInt(process.env.HLS_DOWNLOAD_MAX_SIZE) || 100 * 1024 * 1024,
@@ -344,8 +480,45 @@ class Semaphore {
 const jobSemaphore = new Semaphore(JOB_LIMITS.maxConcurrentJobs);
 
 const generatingLocks = new Map();
+const protectedSongCacheKeys = new Map();
+
+function protectSongCacheForJob(job, songCacheKey) {
+  const key = String(songCacheKey || '');
+  if (!key) return;
+  if (!(job.protectedCacheKeys instanceof Set)) job.protectedCacheKeys = new Set();
+  if (job.protectedCacheKeys.has(key)) return;
+  job.protectedCacheKeys.add(key);
+  protectedSongCacheKeys.set(key, (protectedSongCacheKeys.get(key) || 0) + 1);
+}
+
+function releaseProtectedSongCaches(job) {
+  if (!(job.protectedCacheKeys instanceof Set)) return;
+  for (const key of job.protectedCacheKeys) {
+    const remaining = (protectedSongCacheKeys.get(key) || 0) - 1;
+    if (remaining > 0) protectedSongCacheKeys.set(key, remaining);
+    else protectedSongCacheKeys.delete(key);
+  }
+  job.protectedCacheKeys.clear();
+}
+
+function isSongCacheProtected(songCacheKey) {
+  return (protectedSongCacheKeys.get(String(songCacheKey || '')) || 0) > 0;
+}
 
 const preloadingPlaylists = new Set();
+
+const playlistGenerationJobs = new Map();
+const activePlaylistGenerationJobs = new Map();
+const playlistGenerationQueue = new SerialJobQueue();
+const GENERATION_JOB_TTL_MS = 6 * 60 * 60 * 1000;
+
+function isGenerationJobTerminal(job) {
+  return ['completed', 'failed', 'cancelled', 'upload_failed'].includes(job?.status);
+}
+
+function isGenerationJobActive(job) {
+  return ['queued', 'running', 'finalizing', 'cancelling', 'uploading', 'resolving_link'].includes(job?.status);
+}
 
 const songSegmentInfo = new Map();
 const SEGMENT_INFO_MAX = 1000;
@@ -371,6 +544,12 @@ setInterval(() => {
       deleted++;
     }
     console.log(`[HLS] songSegmentInfo 超限，已清理 ${deleted} 条`);
+  }
+
+  for (const [jobId, job] of playlistGenerationJobs.entries()) {
+    if (isGenerationJobTerminal(job) && now - job.updatedAt > GENERATION_JOB_TTL_MS) {
+      playlistGenerationJobs.delete(jobId);
+    }
   }
 }, 10 * 60 * 1000);
 
@@ -421,10 +600,16 @@ function findFFmpeg() {
 
 const FFMPEG_PATH = findFFmpeg();
 console.log('FFmpeg路径:', FFMPEG_PATH);
+const VIDEO_ENCODER = detectVideoEncoder(FFMPEG_PATH);
+console.log(`视频编码器: ${VIDEO_ENCODER.label}${VIDEO_ENCODER.hardware ? ' (GPU)' : ' (CPU)'}`);
 
 const TEMP_DIR = path.join(__dirname, '..', 'data', 'temp');
+const PLAYLIST_MP4_DIR = path.join(__dirname, '..', 'data', 'playlist-mp4');
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+if (!fs.existsSync(PLAYLIST_MP4_DIR)) {
+  fs.mkdirSync(PLAYLIST_MP4_DIR, { recursive: true });
 }
 
 function toFsCacheKey(songCacheKey) {
@@ -451,6 +636,38 @@ function getSegmentInfoPath(songCacheKey) {
   return path.join(getSongCacheDir(songCacheKey), 'info.json');
 }
 
+function getPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', playlistName = '', order = 'sequential', resolution = '1920x1080', fps = 15) {
+  const options = {
+    name: playlistName,
+    source,
+    mode,
+    quality,
+    resolution,
+    fps,
+    order,
+    playlistId,
+    version: CACHE_VERSION
+  };
+  const storageKey = playlistOutputIdentity(options).replace(/\.mp4$/i, '');
+  return path.join(PLAYLIST_MP4_DIR, storageKey, buildPlaylistOutputFilename(options));
+}
+
+function findPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', playlistName = '', order = 'sequential', resolution = '1920x1080', fps = 15) {
+  const preferred = getPlaylistMp4Path(source, playlistId, mode, quality, playlistName, order, resolution, fps);
+  if (fs.existsSync(preferred)) return preferred;
+  const suffix = buildPlaylistOutputSuffix({ source, mode, quality, resolution, fps, order, playlistId, version: CACHE_VERSION });
+  try {
+    const matches = fs.readdirSync(PLAYLIST_MP4_DIR)
+      .filter((name) => name.endsWith(suffix))
+      .map((name) => path.join(PLAYLIST_MP4_DIR, name))
+      .filter((filePath) => fs.statSync(filePath).isFile())
+      .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+    return matches[0] || preferred;
+  } catch (_) {
+    return preferred;
+  }
+}
+
 function isSongCached(songCacheKey) { 
   try { 
     const infoPath = getSegmentInfoPath(songCacheKey); 
@@ -458,7 +675,9 @@ function isSongCached(songCacheKey) {
      
     const info = JSON.parse(fs.readFileSync(infoPath, 'utf8')); 
     if (info.version !== CACHE_VERSION) return false; 
-    if (!info.video || info.video.width !== COVER_OUTPUT.width || info.video.height !== COVER_OUTPUT.height) return false; 
+    const profile = getProfileFromSongCacheKey(songCacheKey);
+    if (!info.video || info.video.width !== profile.width || info.video.height !== profile.height) return false;
+    if (Number(info.video.fps) !== profile.fps) return false;
     const age = Date.now() - info.timestamp; 
     if (age > CACHE_CONFIG.maxAge) return false; 
 
@@ -472,12 +691,16 @@ function isSongCached(songCacheKey) {
 function getSongSegmentInfo(songId) {
   const key = String(songId);
   const cached = songSegmentInfo.get(key);
-  if (cached) return cached;
+  if (cached && cached.version === CACHE_VERSION) return cached;
 
   try {
     const infoPath = getSegmentInfoPath(key);
     if (!fs.existsSync(infoPath)) return null;
     const info = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
+    if (info.version !== CACHE_VERSION) return null;
+    const profile = getProfileFromSongCacheKey(key);
+    if (!info.video || info.video.width !== profile.width || info.video.height !== profile.height) return null;
+    if (Number(info.video.fps) !== profile.fps) return null;
     songSegmentInfo.set(key, info);
     return info;
   } catch (e) {
@@ -554,7 +777,7 @@ async function cleanupCache(reason = 'interval') {
       const entry = dirents[i]; 
       if (!entry.isDirectory()) continue; 
       const songId = fromFsCacheKey(entry.name);
-      if (generatingLocks.has(songId)) continue;
+      if (generatingLocks.has(songId) || isSongCacheProtected(songId)) continue;
 
       // 跳过最近 30 秒内生成的缓存，避免刚生成就被清理的竞态
       const RECENTLY_GENERATED_GRACE_MS = 30 * 1000;
@@ -595,6 +818,7 @@ async function cleanupCache(reason = 'interval') {
     let freedSize = 0; 
 
     async function deleteSongDir(info) { 
+      if (generatingLocks.has(info.songId) || isSongCacheProtected(info.songId)) return 0;
       try { 
         if (!info.sizeBytes) {
           info.sizeBytes = await getSongDirSizeBytes(info.path);
@@ -640,7 +864,7 @@ async function cleanupCache(reason = 'interval') {
       for (let i = 0; i < remaining.length; i++) { 
         if (totalSize <= targetSize) break; 
         const info = remaining[i]; 
-        if (generatingLocks.has(info.songId)) continue; 
+        if (generatingLocks.has(info.songId) || isSongCacheProtected(info.songId)) continue;
         const freed = await deleteSongDir(info); 
         totalSize -= freed || 0; 
         if (i > 0 && i % 10 === 0) await yieldToEventLoop(); 
@@ -673,7 +897,8 @@ setInterval(() => {
 }, CACHE_CONFIG.cleanupInterval); 
 setTimeout(() => scheduleCacheCleanup('startup'), 5000); 
 
-async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDuration) {
+async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDuration, track = {}, lyricsText = '', onProgress, control = null, renderContext = {}) {
+  if (control?.isCancelled?.()) throw generationCancelledError();
   const acquired = await jobSemaphore.acquire();
   if (!acquired) {
     throw new Error('服务繁忙，请稍后重试');
@@ -686,11 +911,31 @@ async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDurati
   const songCacheDir = getSongCacheDir(songCacheKey);
   const tempM3u8 = path.join(TEMP_DIR, `${safeTempKey}_${timestamp}.m3u8`);
   const tempSegmentPattern = path.join(TEMP_DIR, `${safeTempKey}_${timestamp}_seg_%04d.ts`);
+  const visualBase = path.join(TEMP_DIR, `${safeTempKey}_${timestamp}`);
+  const renderProfile = getProfileFromSongCacheKey(songCacheKey);
+  const fastMode = isFastGenerationMode(renderProfile.mode);
+  const effectiveFps = renderProfile.fps;
+  const textAssets = createTextAssets(visualBase, track, '', {
+    width: renderProfile.width,
+    height: renderProfile.height,
+    truncate: fastMode,
+    ...renderContext
+  });
+  const lyricsFile = `${visualBase}_lyrics.ass`;
+  const effectiveDuration = Math.max(1, Number(songDuration) || Number(track.duration) || 240);
+  const lyricsResult = createLyricsAss(lyricsFile, lyricsText, {
+    width: renderProfile.width,
+    height: renderProfile.height,
+    duration: effectiveDuration,
+    hardCut: fastMode
+  });
   
   const cleanup = () => {
     fs.unlink(tempAudio, () => {});
     fs.unlink(tempCover, () => {});
     fs.unlink(tempM3u8, () => {});
+    removeTextAssets(textAssets);
+    fs.unlink(lyricsFile, () => {});
     try {
       const tempFiles = fs.readdirSync(TEMP_DIR);
       for (const f of tempFiles) {
@@ -707,6 +952,7 @@ async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDurati
   };
   
   try {
+    if (control?.isCancelled?.()) throw generationCancelledError();
     if (!fs.existsSync(songCacheDir)) {
       fs.mkdirSync(songCacheDir, { recursive: true });
     }
@@ -716,6 +962,7 @@ async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDurati
       downloadFile(audioUrl, tempAudio),
       downloadFile(coverUrl, tempCover)
     ]);
+    if (control?.isCancelled?.()) throw generationCancelledError();
     
     if (LOG_VERBOSE) console.log(`[分片缓存] 正在转码并分片: ${songCacheKey}`);
     
@@ -727,7 +974,19 @@ async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDurati
       tempCover,
       tempM3u8,
       tempSegmentPattern,
-      songCacheDir
+      songCacheDir,
+      textAssets,
+      lyricsFile,
+      duration: effectiveDuration,
+      width: renderProfile.width,
+      height: renderProfile.height,
+      fps: effectiveFps,
+      audioBitrate: getGenerationAudioBitrate(renderProfile.quality),
+      fastMode,
+      hasLyrics: lyricsResult.cueCount > 0,
+      showCollection: textAssets.showCollection,
+      onProgress,
+      control
     });
     
     scheduleCacheCleanup('after-generate');
@@ -741,10 +1000,11 @@ async function generateSongSegments(songCacheKey, audioUrl, coverUrl, songDurati
   }
 }
 
-function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, tempCover, tempM3u8, tempSegmentPattern, songCacheDir }) {
+function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, tempCover, tempM3u8, tempSegmentPattern, songCacheDir, textAssets, lyricsFile, duration, width, height, fps, audioBitrate, fastMode, hasLyrics, showCollection, onProgress, control }) {
   return new Promise((resolve, reject) => {
     const segmentDuration = CACHE_CONFIG.segmentDuration;
-    const gop = Math.max(1, Math.round(COVER_FPS * segmentDuration));
+    const frameRate = Math.max(1, Math.round(Number(fps) || VIDEO_VISUAL_FPS));
+    const gop = Math.max(1, Math.round(frameRate * segmentDuration));
     let stallTimer = null;
     let ffmpegKilled = false;
     let ffmpegError = '';
@@ -754,40 +1014,51 @@ function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, t
       lastActivityAt = Date.now();
     }
     
-    const vf = [
-      `scale=${COVER_OUTPUT.width}:${COVER_OUTPUT.height}:force_original_aspect_ratio=decrease`,
-      `pad=${COVER_OUTPUT.width}:${COVER_OUTPUT.height}:(ow-iw)/2:(oh-ih)/2`,
-      'setsar=1'
-    ].join(',');
+    const visualFilter = buildVisualFilter({
+      width,
+      height,
+      fps: frameRate,
+      duration,
+      textFiles: textAssets.files,
+      lyricsFile,
+      staticText: fastMode === true,
+      disableFade: fastMode === true,
+      hasLyrics: hasLyrics === true,
+      showCollection: showCollection === true
+    });
 
     const ffmpegArgs = [
       '-loop', '1',
-      '-framerate', String(COVER_FPS),
+      '-framerate', String(frameRate),
       '-i', tempCover,
       '-i', tempAudio,
+      '-filter_complex', visualFilter,
+      '-map', '[vout]',
+      '-map', '1:a:0',
     ];
 
     if (HLS_FFMPEG_THREADS > 0) {
-      ffmpegArgs.push('-threads', String(HLS_FFMPEG_THREADS));
+      ffmpegArgs.push('-filter_complex_threads', String(HLS_FFMPEG_THREADS));
+      if (!VIDEO_ENCODER.hardware) ffmpegArgs.push('-threads', String(HLS_FFMPEG_THREADS));
     }
 
     ffmpegArgs.push(
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-tune', 'stillimage',
-      '-crf', '28',
-      '-r', String(COVER_FPS),
+      ...VIDEO_ENCODER.args,
+      '-r', String(frameRate),
       '-g', String(gop),
       '-keyint_min', String(gop),
       '-sc_threshold', '0',
       '-force_key_frames', `expr:gte(t,n_forced*${segmentDuration})`,
       '-c:a', 'aac',
-      '-b:a', '128k',
+      '-b:a', String(audioBitrate || '192k'),
       '-ar', '44100',
-      '-pix_fmt', 'yuv420p',
-      '-vf', vf,
+      '-ac', '2',
+      '-af', 'aresample=async=1:first_pts=0',
+      '-pix_fmt', VIDEO_ENCODER.pixelFormat,
       '-shortest',
       '-f', 'hls',
+      '-muxdelay', '0',
+      '-muxpreload', '0',
       '-hls_time', String(segmentDuration),
       '-hls_list_size', '0',
       '-hls_segment_type', 'mpegts',
@@ -797,10 +1068,23 @@ function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, t
     );
 
     const ffmpegProcess = spawn(FFMPEG_PATH, ffmpegArgs);
+    control?.registerProcess?.(ffmpegProcess);
+    if (control?.isCancelled?.()) {
+      try { ffmpegProcess.kill('SIGKILL'); } catch (_) {}
+    }
     
     ffmpegProcess.stderr.on('data', (data) => {
-      ffmpegError += data.toString();
+      const output = data.toString();
+      ffmpegError += output;
       markActivity();
+      if (typeof onProgress === 'function') {
+        const matches = Array.from(output.matchAll(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/g));
+        const match = matches[matches.length - 1];
+        if (match) {
+          const seconds = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+          onProgress(Math.max(0, Math.min(0.99, seconds / Math.max(1, duration))));
+        }
+      }
     });
     
     // 用“无输出/无进展超时”替代固定总时长超时：弱机器或长歌转码可能超过固定阈值，但只要持续输出进度就不应被杀。
@@ -815,11 +1099,18 @@ function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, t
     
     ffmpegProcess.on('error', (err) => {
       clearInterval(stallTimer);
-      reject(err);
+      control?.unregisterProcess?.(ffmpegProcess);
+      reject(control?.isCancelled?.() ? generationCancelledError() : err);
     });
     
     ffmpegProcess.on('close', (code) => {
       clearInterval(stallTimer);
+      control?.unregisterProcess?.(ffmpegProcess);
+
+      if (control?.isCancelled?.()) {
+        reject(generationCancelledError());
+        return;
+      }
       
       if (ffmpegKilled) {
         reject(new Error('FFmpeg无输出超时'));
@@ -866,7 +1157,7 @@ function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, t
           segmentDurations: segmentDurations, 
           totalDuration: segmentDurations.reduce((a, b) => a + b, 0), 
           cacheBytes,
-          video: { width: COVER_OUTPUT.width, height: COVER_OUTPUT.height }, 
+          video: { width, height, fps: frameRate },
           timestamp: Date.now() 
         }; 
         fs.writeFileSync(getSegmentInfoPath(songCacheKey), JSON.stringify(info));
@@ -882,10 +1173,10 @@ function runFFmpegTranscode({ songCacheKey, safeTempKey, timestamp, tempAudio, t
   });
 }
 
-async function autoPreloadInBackground({ songs, cookie, coverUrl, playlistId, source, mode }) {
+async function autoPreloadInBackground({ songs, cookie, coverUrl, playlistId, source, mode, quality, resolution, fps }) {
   const adapter = getSourceAdapter(source);
   const firstSongId = getSongIdForTrack(Array.isArray(songs) ? songs[0] : null, source);
-  const preloadKey = `${source}:${mode}:${playlistId}_${firstSongId}`;
+  const preloadKey = `${source}:${mode}:${quality}:${resolution}:${fps}:${playlistId}_${firstSongId}`;
   if (preloadingPlaylists.has(preloadKey)) {
     return;
   }
@@ -900,7 +1191,7 @@ async function autoPreloadInBackground({ songs, cookie, coverUrl, playlistId, so
     if (!isValidSongIdForSource(rawSongId, source)) {
       continue;
     }
-    const songCacheKey = getScopedSongCacheKey(rawSongId, source, mode);
+    const songCacheKey = getScopedSongCacheKey(rawSongId, source, mode, quality, resolution, fps);
 
     if (isSongCached(songCacheKey)) {
       continue;
@@ -911,14 +1202,17 @@ async function autoPreloadInBackground({ songs, cookie, coverUrl, playlistId, so
     }
     
     try {
-      const audioUrl = await adapter.getSongUrl(rawSongId, cookie);
+      const [audioUrl, lyricsText] = await Promise.all([
+        adapter.getSongUrl(rawSongId, cookie, quality),
+        adapter.getLyrics(rawSongId, cookie)
+      ]);
       if (!audioUrl) {
         console.log(`[自动预加载] 跳过 ${rawSongId}：无法获取URL`);
         continue;
       }
       
       const perSongCover = isLiteVideoMode(mode) ? coverUrl : pickCoverUrlForSong(song, coverUrl);
-      const generatePromise = generateSongSegments(songCacheKey, audioUrl, perSongCover, song.duration);
+      const generatePromise = generateSongSegments(songCacheKey, audioUrl, perSongCover, song.duration, song, lyricsText);
       generatePromise._createdAt = Date.now();
       generatingLocks.set(songCacheKey, generatePromise);
       
@@ -936,7 +1230,7 @@ async function autoPreloadInBackground({ songs, cookie, coverUrl, playlistId, so
   console.log(`[自动预加载] 全部完成`);
 }
 
-async function preloadNextSongs({ playlistId, currentSongId, cookie, source, mode }) {
+async function preloadNextSongs({ playlistId, currentSongId, cookie, source, mode, quality, resolution, fps }) {
   const adapter = getSourceAdapter(source);
   const playlistCacheKey = getPlaylistCacheKey(playlistId, source);
   try {
@@ -961,7 +1255,7 @@ async function preloadNextSongs({ playlistId, currentSongId, cookie, source, mod
     const nextSongs = songs.slice(currentIndex + 1, currentIndex + 3);
     if (nextSongs.length === 0) return;
     
-    const preloadKey = `next:${source}:${mode}:${currentSongId}`;
+    const preloadKey = `next:${source}:${mode}:${quality}:${resolution}:${fps}:${currentSongId}`;
     if (preloadingPlaylists.has(preloadKey)) return;
     preloadingPlaylists.add(preloadKey);
     
@@ -970,17 +1264,20 @@ async function preloadNextSongs({ playlistId, currentSongId, cookie, source, mod
     for (const song of nextSongs) {
       const rawSongId = getSongIdForTrack(song, source);
       if (!isValidSongIdForSource(rawSongId, source)) continue;
-      const songCacheKey = getScopedSongCacheKey(rawSongId, source, mode);
+      const songCacheKey = getScopedSongCacheKey(rawSongId, source, mode, quality, resolution, fps);
       if (isSongCached(songCacheKey) || generatingLocks.has(songCacheKey)) {
         continue;
       }
       
       try {
-        const audioUrl = await adapter.getSongUrl(rawSongId, cookie);
+        const [audioUrl, lyricsText] = await Promise.all([
+          adapter.getSongUrl(rawSongId, cookie, quality),
+          adapter.getLyrics(rawSongId, cookie)
+        ]);
         if (!audioUrl) continue;
         
         const perSongCover = isLiteVideoMode(mode) ? coverUrl : pickCoverUrlForSong(song, coverUrl);
-        const generatePromise = generateSongSegments(songCacheKey, audioUrl, perSongCover, song.duration);
+        const generatePromise = generateSongSegments(songCacheKey, audioUrl, perSongCover, song.duration, song, lyricsText);
         generatePromise._createdAt = Date.now();
         generatingLocks.set(songCacheKey, generatePromise);
         
@@ -999,7 +1296,7 @@ async function preloadNextSongs({ playlistId, currentSongId, cookie, source, mod
   }
 }
 
-function downloadFile(url, filePath, redirectCount = 0) {
+function downloadFileOnce(url, filePath, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     if (redirectCount >= JOB_LIMITS.downloadMaxRedirects) {
       return reject(new Error('Too many redirects'));
@@ -1021,16 +1318,9 @@ function downloadFile(url, filePath, redirectCount = 0) {
       timeout: JOB_LIMITS.downloadTimeout 
     }; 
     
-    const file = fs.createWriteStream(filePath);
-    let downloadedSize = 0;
-    let aborted = false;
-    
     const req = protocol.get(url, options, (response) => {
       if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         response.resume();
-        file.close();
-        fs.unlink(filePath, () => {});
-        
         const redirectLocation = response.headers.location;
         if (!redirectLocation) {
           return reject(new Error('Redirect without location'));
@@ -1048,52 +1338,56 @@ function downloadFile(url, filePath, redirectCount = 0) {
           return reject(new Error(`Redirect blocked: ${redirectCheck.reason}`));
         }
         
-        return downloadFile(redirectUrl, filePath, redirectCount + 1).then(resolve).catch(reject);
+        return downloadFileOnce(redirectUrl, filePath, redirectCount + 1).then(resolve).catch(reject);
       }
       
       if (response.statusCode !== 200) {
-        file.close();
-        fs.unlink(filePath, () => {});
+        response.resume();
         return reject(new Error(`HTTP ${response.statusCode}`));
       }
       
       const contentLength = parseInt(response.headers['content-length']);
       if (contentLength && contentLength > JOB_LIMITS.downloadMaxSize) {
         req.destroy();
-        file.close();
-        fs.unlink(filePath, () => {});
+        response.resume();
         return reject(new Error(`File too large: ${contentLength} bytes`));
       }
-      
+
+      const file = fs.createWriteStream(filePath);
+      let downloadedSize = 0;
+      let settled = false;
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        file.destroy();
+        response.destroy();
+        fs.unlink(filePath, () => {});
+        reject(error);
+      };
+      file.on('error', fail);
       response.on('data', (chunk) => {
         downloadedSize += chunk.length;
         if (downloadedSize > JOB_LIMITS.downloadMaxSize) {
-          aborted = true;
           req.destroy();
-          file.close();
-          fs.unlink(filePath, () => {});
-          reject(new Error(`Download exceeded max size: ${downloadedSize} bytes`));
+          fail(new Error(`Download exceeded max size: ${downloadedSize} bytes`));
         }
       });
+      response.on('aborted', () => fail(new Error('Download response aborted')));
+      response.on('error', fail);
       
       response.pipe(file);
       file.on('finish', () => {
-        if (!aborted) {
-          file.close();
-          resolve(filePath);
-        }
+        if (settled) return;
+        settled = true;
+        file.close((error) => error ? reject(error) : resolve(filePath));
       });
     });
     
     req.on('timeout', () => {
-      req.destroy();
-      file.close();
-      fs.unlink(filePath, () => {});
-      reject(new Error('Download timeout'));
+      req.destroy(new Error('Download timeout'));
     });
     
     req.on('error', (err) => {
-      file.close();
       fs.unlink(filePath, () => {});
       reject(err);
     });
@@ -1108,10 +1402,902 @@ function getBaseUrl(req) {
   return `${req.protocol}://${req.get('host')}`;
 }
 
+function generationJobKey(source, userId, playlistId, mode, quality, resolution, fps, order) {
+  return `${source}:${userId}:${playlistId}:${mode || 'default'}:${quality}:${resolution}:${fps}fps:${order === 'shuffle' ? 'shuffle' : 'sequential'}`;
+}
+
+function generationStatusPath(source, token, playlistId, jobId) {
+  const basePath = source === 'qq' ? '/api/qq/playlist-video' : '/api/playlist-video';
+  return `${basePath}/${encodeURIComponent(token)}/${encodeURIComponent(playlistId)}/generate/${encodeURIComponent(jobId)}`;
+}
+
+function generationCancelPath(source, token, playlistId, jobId) {
+  return `${generationStatusPath(source, token, playlistId, jobId)}/cancel`;
+}
+
+function generationCancelledError() {
+  const error = new Error('生成已取消');
+  error.code = 'GENERATION_CANCELLED';
+  return error;
+}
+
+function buildPlaylistMp4(job, songs) {
+  if (job.cancelRequested) return Promise.reject(generationCancelledError());
+  const outputPath = getPlaylistMp4Path(job.source, job.playlistId, job.mode, job.quality, job.playlistName, job.order, job.resolution, job.fps);
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  const tempKey = `${job.source}_${job.playlistId}_${job.id}`.replace(/[^A-Za-z0-9_-]/g, '_');
+  const listPath = path.join(TEMP_DIR, `${tempKey}_concat.txt`);
+  const tempOutput = path.join(TEMP_DIR, `${tempKey}_playlist.mp4`);
+  const entries = [];
+
+  for (let songIndex = 0; songIndex < songs.length; songIndex++) {
+    if (job.skippedIndexes instanceof Set && job.skippedIndexes.has(songIndex)) continue;
+    const song = songs[songIndex];
+    const songId = getSongIdForTrack(song, job.source);
+    const renderContext = createSongRenderContext(job, songIndex + 1, songs.length);
+    const songCacheKey = getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext);
+    const info = getSongSegmentInfo(songCacheKey);
+    if (!info || !Number.isInteger(info.segmentCount) || info.segmentCount < 1) {
+      return Promise.reject(new Error(`歌曲 ${songId} 的视频缓存不完整`));
+    }
+    for (let index = 0; index < info.segmentCount; index++) {
+      const segmentPath = getSegmentPath(songCacheKey, index);
+      if (!fs.existsSync(segmentPath)) return Promise.reject(new Error(`歌曲 ${songId} 缺少视频片段`));
+      entries.push(`file '${segmentPath.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`);
+    }
+  }
+
+  if (entries.length === 0) return Promise.reject(new Error('没有可合并的视频片段'));
+  fs.writeFileSync(listPath, `${entries.join('\n')}\n`, 'utf8');
+
+  return new Promise((resolve, reject) => {
+    let stderr = '';
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      job.ffmpegProcesses.delete(process);
+      try { fs.unlinkSync(listPath); } catch (_) {}
+      if (error) {
+        try { fs.unlinkSync(tempOutput); } catch (_) {}
+        reject(error);
+      } else {
+        try {
+          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+          fs.renameSync(tempOutput, outputPath);
+          resolve(outputPath);
+        } catch (moveError) {
+          reject(moveError);
+        }
+      }
+    };
+
+    const process = spawn(FFMPEG_PATH, [
+      '-hide_banner', '-loglevel', 'warning',
+      '-fflags', '+genpts',
+      '-f', 'concat', '-safe', '0', '-i', listPath,
+      '-map', '0:v:0', '-map', '0:a:0',
+      '-c', 'copy',
+      '-bsf:a', 'aac_adtstoasc',
+      '-avoid_negative_ts', 'make_zero',
+      '-movflags', '+faststart',
+      '-y', tempOutput
+    ]);
+    job.ffmpegProcesses.add(process);
+    if (job.cancelRequested) {
+      try { process.kill('SIGKILL'); } catch (_) {}
+    }
+    process.stderr.on('data', (data) => { stderr += data.toString(); });
+    process.on('error', (error) => finish(job.cancelRequested ? generationCancelledError() : error));
+    process.on('close', (code) => {
+      if (job.cancelRequested) return finish(generationCancelledError());
+      if (code !== 0) return finish(new Error(`合并 MP4 失败: ${stderr.slice(-500)}`));
+      finish();
+    });
+  });
+}
+
+function isRetryableNetworkError(error) {
+  const message = String(error?.message || error || '');
+  const code = String(error?.code || '');
+  return /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|ENETUNREACH|ECONNREFUSED|socket hang up|aborted|Download timeout|HTTP (?:408|425|429|5\d\d)/i
+    .test(`${code} ${message}`);
+}
+
+async function downloadFile(url, filePath, options = {}) {
+  const maxAttempts = Math.max(1, Math.min(5, Number(options.maxAttempts) || 3));
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const attemptPath = `${filePath}.part-${attempt}-${crypto.randomBytes(4).toString('hex')}`;
+    try {
+      await downloadFileOnce(url, attemptPath);
+      try { fs.unlinkSync(filePath); } catch (_) {}
+      fs.renameSync(attemptPath, filePath);
+      return filePath;
+    } catch (error) {
+      lastError = error;
+      try { fs.unlinkSync(attemptPath); } catch (_) {}
+      if (attempt >= maxAttempts || !isRetryableNetworkError(error)) throw error;
+      const delayMs = 400 * attempt + crypto.randomInt(0, 180);
+      console.warn(`[下载重试] 第 ${attempt}/${maxAttempts} 次失败，${delayMs}ms 后重试: ${error?.message || error}`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError || new Error('Download failed');
+}
+
+function generationJobSnapshot(job) {
+  const uploadOnly = job.taskType === 'upload_only';
+  const activeSongs = job.activeSongs instanceof Map ? Array.from(job.activeSongs.values()) : [];
+  // 单曲进度只能贡献 0~1 首，避免 FFmpeg/复用任务传入百分数时把整单进度虚高。
+  const activeProgress = activeSongs.reduce((total, item) => {
+    const value = Number(item.progress);
+    return total + (Number.isFinite(value) ? Math.max(0, Math.min(0.99, value)) : 0);
+  }, 0);
+  const renderFinished = Boolean(job.outputPath) || ['completed', 'uploading', 'resolving_link', 'upload_failed'].includes(job.status);
+  const skipped = Math.max(0, Number(job.skipped) || 0);
+  const processed = Math.min(job.total, job.completed + skipped);
+  const fractional = renderFinished
+    ? job.total
+    : Math.min(job.total * 0.99, processed + activeProgress);
+  const renderPercent = job.total > 0 ? Math.max(0, Math.min(100, Math.round(fractional / job.total * 100))) : 0;
+  const percent = uploadOnly
+    ? (job.status === 'queued' ? 0 : Math.max(0, Math.min(100, Number(job.uploadPercent) || 0)))
+    : renderPercent;
+  const activeWorkSeconds = activeSongs.reduce((total, item) => {
+    const workSeconds = Math.max(0, Number(item.workSeconds) || 0);
+    const progress = Math.max(0, Math.min(1, Number(item.progress) || 0));
+    return total + workSeconds * progress;
+  }, 0);
+  const timingJob = job.outputPath && job.renderFinishedAt
+    ? { ...job, status: 'completed', finishedAt: job.renderFinishedAt }
+    : job;
+  const timing = uploadOnly
+    ? {
+        elapsedSeconds: Math.max(0, Math.floor(((job.finishedAt || Date.now()) - job.createdAt) / 1000)),
+        etaSeconds: null
+      }
+    : estimateGenerationTiming(timingJob, activeWorkSeconds);
+  return {
+    id: job.id,
+    source: job.source,
+    playlistId: job.playlistId,
+    playlistName: job.playlistName || `歌单 ${job.playlistId}`,
+    playlistCover: job.playlistCover || '',
+    playlistCreator: job.playlistCreator || '',
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    finishedAt: job.finishedAt || null,
+    status: job.status,
+    taskType: uploadOnly ? 'upload_only' : 'generate',
+    queuePosition: job.status === 'queued' ? playlistGenerationQueue.position(job.id) : 0,
+    total: job.total,
+    completed: job.completed,
+    processed: uploadOnly ? (job.status === 'completed' ? 1 : 0) : processed,
+    skipped,
+    skippedSongs: Array.isArray(job.skippedSongs)
+      ? job.skippedSongs.slice().sort((left, right) => left.index - right.index)
+      : [],
+    percent,
+    elapsedSeconds: timing.elapsedSeconds,
+    etaSeconds: timing.etaSeconds,
+    currentSong: activeSongs.map((item) => item.name).filter(Boolean).join('、') || job.currentSong || '',
+    message: job.message || '',
+    error: job.error || '',
+    encoder: VIDEO_ENCODER.label,
+    gpu: VIDEO_ENCODER.hardware,
+    concurrency: job.concurrency || 1,
+    requestedConcurrency: job.requestedConcurrency || job.concurrency || 4,
+    order: job.order === 'shuffle' ? 'shuffle' : 'sequential',
+    mode: isFastGenerationMode(job.mode) ? 'fast' : (isLiteVideoMode(job.mode) ? 'lite_video' : ''),
+    quality: job.quality,
+    resolution: job.resolution,
+    fps: job.fps,
+    localPath: job.outputPath ? path.resolve(job.outputPath) : '',
+    uploadStatus: job.uploadStatus || (job.outputPath ? 'pending' : 'waiting'),
+    uploadPercent: Math.max(0, Math.min(100, Number(job.uploadPercent) || 0)),
+    uploadMessage: job.uploadMessage || '',
+    uploadError: job.uploadError || '',
+    publicUrl: job.publicUrl || '',
+    shareUrl: job.shareUrl || '',
+    statusPath: job.statusPath,
+    cancelPath: job.cancelPath,
+    canCancel: uploadOnly ? job.status === 'queued' : ['queued', 'running', 'finalizing', 'cancelling'].includes(job.status),
+    canDismiss: isGenerationJobTerminal(job)
+  };
+}
+
+function recordGenerationHistory(job) {
+  try {
+    generationHistoryOps.add.run({
+      job_id: job.id,
+      source: job.source,
+      user_id: job.userId,
+      playlist_id: job.playlistId,
+      playlist_name: job.playlistName || '未命名歌单',
+      playlist_cover: job.playlistCover || '',
+      playlist_creator: job.playlistCreator || '未知作者',
+      generated_at: new Date(job.renderFinishedAt || Date.now()).toISOString(),
+      generation_seconds: Math.max(0, Math.round(((job.renderFinishedAt || Date.now()) - job.createdAt) / 1000)),
+      public_url: job.publicUrl || '',
+      local_path: path.resolve(job.outputPath),
+      upload_status: job.uploadStatus || 'pending'
+    });
+  } catch (error) {
+    console.error(`[生成历史] ${job.source}:${job.playlistId} 保存失败:`, error?.message || error);
+  }
+}
+
+function updateGenerationHistoryUpload(job) {
+  try {
+    generationHistoryOps.updateUpload.run(job.publicUrl || '', job.uploadStatus || '', job.historyJobId || job.id);
+  } catch (error) {
+    console.error(`[生成历史] ${job.source}:${job.playlistId} 更新上传结果失败:`, error?.message || error);
+  }
+}
+
+async function uploadGeneratedVideo(job) {
+  job.status = 'uploading';
+  job.currentSong = '';
+  job.activeSongs.clear();
+  job.message = '视频已生成，正在上传获取公开链接';
+  job.uploadStatus = 'uploading';
+  job.uploadPercent = 0;
+  job.uploadMessage = '正在准备上传视频';
+  job.updatedAt = Date.now();
+
+  const savedCredential = uploadCredentialOps.get.get(job.source, job.userId, 'tmplink');
+  const uploadToken = savedCredential ? decrypt(savedCredential.encrypted_token) : '';
+  if (!uploadToken) {
+    job.status = 'upload_failed';
+    job.uploadStatus = 'not_configured';
+    job.uploadError = '尚未在个人中心配置有效的 TMPLINK Token';
+    job.uploadMessage = '本地视频已生成；配置 TMPLINK Token 后才能获取公开链接';
+    job.message = '视频已生成，公开链接未上传';
+    job.finishedAt = Date.now();
+    job.updatedAt = Date.now();
+    updateGenerationHistoryUpload(job);
+    return;
+  }
+
+  try {
+    const client = new TmpLinkClient(uploadToken);
+    const result = await client.uploadAndGetDirectUrl(job.outputPath, {
+      filename: path.basename(job.outputPath),
+      model: 2,
+      onProgress(progress = {}) {
+        job.uploadStatus = progress.phase || job.uploadStatus;
+        job.uploadPercent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+        job.uploadMessage = progress.message || job.uploadMessage;
+        job.status = progress.phase === 'resolving' ? 'resolving_link' : 'uploading';
+        job.message = progress.phase === 'resolving'
+          ? '视频已生成，正在获取公开链接'
+          : '视频已生成，正在上传获取公开链接';
+        job.updatedAt = Date.now();
+      }
+    });
+    job.publicUrl = result.directUrl;
+    job.shareUrl = result.shareUrl;
+    job.status = 'completed';
+    job.uploadStatus = 'completed';
+    job.uploadPercent = 100;
+    job.uploadMessage = '公开链接已生成';
+    job.message = '视频已生成并上传，公开直链可用';
+  } catch (error) {
+    job.status = 'upload_failed';
+    job.uploadStatus = 'failed';
+    job.uploadError = error?.message || '上传失败';
+    job.uploadMessage = '本地视频已生成，但获取公开链接失败';
+    job.message = '视频已生成，公开链接上传失败';
+    console.error(`[TMPLINK] ${job.source}:${job.playlistId} 上传失败:`, error?.message || error);
+  }
+  job.finishedAt = Date.now();
+  job.updatedAt = Date.now();
+  updateGenerationHistoryUpload(job);
+}
+
+async function runUploadOnlyJob(job) {
+  try {
+    await uploadGeneratedVideo(job);
+    if (job.status === 'completed') job.completed = 1;
+  } finally {
+    job.updatedAt = Date.now();
+    if (activePlaylistGenerationJobs.get(job.key) === job.id) {
+      activePlaylistGenerationJobs.delete(job.key);
+    }
+  }
+}
+
+async function runPlaylistGenerationJob(job, { adapter, cookie, token }) {
+  try {
+    job.status = 'running';
+    job.message = '正在读取完整歌单';
+    job.updatedAt = Date.now();
+
+    let playlist = readCachedPlaylistDetail(job.playlistId, job.source);
+    if (!playlist) {
+      try {
+        playlist = await adapter.getPlaylistDetail(job.playlistId, cookie);
+        cachePlaylistDetail(job.playlistId, job.source, playlist);
+      } catch (error) {
+        throw new Error(`读取歌单失败：${error?.message || error}`);
+      }
+    } else {
+      const cachedTracks = Array.isArray(playlist.tracks) ? playlist.tracks : [];
+      if (cachedTracks.length > 1 && !playlist.creator) {
+        try {
+          const refreshed = await adapter.getPlaylistDetail(job.playlistId, cookie);
+          if (refreshed?.tracks?.length) {
+            playlist = refreshed;
+            cachePlaylistDetail(job.playlistId, job.source, refreshed);
+          }
+        } catch (error) {
+          // 作者信息属于非关键视觉元数据；网络波动时继续使用已有歌曲缓存生成。
+          console.warn(`[整单生成] ${job.source}:${job.playlistId} 刷新歌单作者失败，继续使用缓存: ${error?.message || error}`);
+        }
+      }
+    }
+    if (job.cancelRequested) throw generationCancelledError();
+    const playlistTracks = Array.isArray(playlist.tracks) ? playlist.tracks : [];
+    const songs = job.order === 'shuffle' ? shuffleTracks(playlistTracks) : playlistTracks;
+    job.playlistName = playlist.name || songs[0]?.name || 'playlist';
+    job.playlistCreator = playlist.creator || songs[0]?._collectionCreator || '';
+    job.playlistCover = playlist.cover || songs[0]?.cover || DEFAULT_COVER_URL;
+    if (songs.length === 0) throw new Error('歌单中没有可生成的歌曲');
+
+    job.total = songs.length;
+    job.completed = 0;
+    job.skipped = 0;
+    job.skippedSongs = [];
+    job.skippedIndexes = new Set();
+    job.songProgress = 0;
+    job.activeSongs = new Map();
+    const protectedCacheKeys = songs.map((song, index) => {
+      const songId = getSongIdForTrack(song, job.source);
+      const renderContext = createSongRenderContext(job, index + 1, songs.length);
+      return getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext);
+    });
+    for (const cacheKey of protectedCacheKeys) protectSongCacheForJob(job, cacheKey);
+    const plannedWorkSeconds = songs.map((song, index) => {
+      const cacheKey = protectedCacheKeys[index];
+      return isSongCached(cacheKey) ? 0 : Math.max(1, Number(song.duration) || 240);
+    });
+    job.workTotalSeconds = plannedWorkSeconds.reduce((total, seconds) => total + seconds, 0);
+    job.workCompletedSeconds = 0;
+    job.workStartedAt = Date.now();
+    let playlistCover = playlist.cover || DEFAULT_COVER_URL;
+    if (isLiteVideoMode(job.mode)) {
+      const picked = await getOrBindBg({
+        token,
+        playlistId: job.playlistId,
+        source: job.source,
+        fallbackUrl: playlistCover
+      });
+      if (isDownloadUrlAllowed(picked).allowed) playlistCover = picked;
+    }
+
+    let nextIndex = 0;
+    let firstError = null;
+    const workerCount = Math.min(job.requestedConcurrency || 4, JOB_LIMITS.maxConcurrentJobs, songs.length);
+    job.concurrency = workerCount;
+
+    async function generateNextSong() {
+      while (!firstError && !job.cancelRequested) {
+        const index = nextIndex++;
+        if (index >= songs.length) return;
+        const song = songs[index];
+      const songId = getSongIdForTrack(song, job.source);
+      if (!isValidSongIdForSource(songId, job.source)) {
+          firstError = new Error(`第 ${index + 1} 首歌曲缺少有效 ID`);
+          return;
+      }
+
+        const songName = song.name || song.title || songId;
+        const renderContext = createSongRenderContext(job, index + 1, songs.length);
+        const songCacheKey = getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext);
+        const needsGeneration = !isSongCached(songCacheKey);
+        let workSeconds = needsGeneration ? plannedWorkSeconds[index] : 0;
+        if (!needsGeneration && plannedWorkSeconds[index] > 0) {
+          job.workTotalSeconds = Math.max(0, job.workTotalSeconds - plannedWorkSeconds[index]);
+          workSeconds = 0;
+        }
+        job.activeSongs.set(index, { name: songName, progress: 0, workSeconds });
+        job.currentSong = songName;
+        job.message = `正在并行生成 ${workerCount} 首（已处理 ${job.completed + job.skipped}/${songs.length}${job.skipped ? `，跳过 ${job.skipped}` : ''}）`;
+      job.updatedAt = Date.now();
+
+        try {
+          if (job.cancelRequested) throw generationCancelledError();
+          if (needsGeneration) {
+        let generation = generatingLocks.get(songCacheKey);
+        if (!generation) {
+          let audioUrl;
+          try {
+            audioUrl = await adapter.getSongUrl(songId, cookie, job.quality);
+          } catch (error) {
+            if (error?.code === 'SONG_UNPLAYABLE') throw error;
+            throw new Error(`获取《${songName}》${{ low: '低', medium: '中', high: '高' }[job.quality]}音质音频地址失败：${error?.message || error}`);
+          }
+          const lyricsText = await adapter.getLyrics(songId, cookie).catch((error) => {
+            console.warn(`[整单生成] 《${songName}》歌词获取失败，按无歌词继续: ${error?.message || error}`);
+            return { original: '', translation: '' };
+          });
+              if (!audioUrl) throw new Error(`无法获取《${songName}》的音频地址`);
+          const coverUrl = isLiteVideoMode(job.mode)
+            ? playlistCover
+            : pickCoverUrlForSong(song, playlistCover);
+          generation = generateSongSegments(
+            songCacheKey,
+            audioUrl,
+            coverUrl,
+            song.duration,
+            song,
+            lyricsText,
+            (progress) => {
+                  const active = job.activeSongs.get(index);
+                  if (active) active.progress = progress;
+              job.updatedAt = Date.now();
+            },
+            {
+              isCancelled: () => job.cancelRequested,
+              registerProcess: (process) => job.ffmpegProcesses.add(process),
+              unregisterProcess: (process) => job.ffmpegProcesses.delete(process)
+            },
+            renderContext
+          );
+          generation._createdAt = Date.now();
+          generatingLocks.set(songCacheKey, generation);
+          generation.finally(() => {
+            if (generatingLocks.get(songCacheKey) === generation) generatingLocks.delete(songCacheKey);
+          }).catch(() => {});
+        }
+        const outcome = await Promise.race([
+          generation.then(() => 'generated'),
+          job.cancelSignal.then(() => 'cancelled')
+        ]);
+        if (outcome === 'cancelled') throw generationCancelledError();
+      }
+
+          if (!isSongCached(songCacheKey)) throw new Error(`《${songName}》生成后校验失败`);
+          if (needsGeneration) job.workCompletedSeconds += workSeconds;
+          job.completed += 1;
+        } catch (error) {
+          if (error?.code === 'SONG_UNPLAYABLE') {
+            job.skipped += 1;
+            job.skippedIndexes.add(index);
+            job.skippedSongs.push({
+              index: index + 1,
+              id: String(songId),
+              name: String(songName),
+              reason: '版权或音源限制，当前不可播放'
+            });
+            if (workSeconds > 0) {
+              job.workTotalSeconds = Math.max(job.workCompletedSeconds, job.workTotalSeconds - workSeconds);
+            }
+            console.warn(`[整单生成] 跳过不可播放歌曲 ${index + 1}/${songs.length}《${songName}》(${songId})`);
+          } else if (!firstError) {
+            firstError = error?.code === 'GENERATION_CANCELLED'
+              ? error
+              : new Error(`生成《${songName}》失败：${error?.message || error}`);
+          }
+        } finally {
+          job.activeSongs.delete(index);
+        }
+        job.message = `正在并行生成 ${workerCount} 首（已处理 ${job.completed + job.skipped}/${songs.length}${job.skipped ? `，跳过 ${job.skipped}` : ''}）`;
+      job.updatedAt = Date.now();
+      }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, () => generateNextSong()));
+    if (job.cancelRequested) throw generationCancelledError();
+    if (firstError) throw firstError;
+    if (job.completed === 0) throw new Error('歌单中的歌曲均不可播放，无法生成视频');
+
+    job.status = 'finalizing';
+    job.message = job.skipped
+      ? `正在合并整张歌单 MP4（已跳过 ${job.skipped} 首不可播放歌曲）`
+      : '正在合并整张歌单 MP4';
+    job.currentSong = '';
+    job.activeSongs.clear();
+    job.updatedAt = Date.now();
+    job.outputPath = await buildPlaylistMp4(job, songs);
+    job.renderFinishedAt = Date.now();
+    recordGenerationHistory(job);
+    releaseProtectedSongCaches(job);
+    scheduleCacheCleanup('after-playlist-merge');
+    if (job.cancelRequested) throw generationCancelledError();
+
+    await uploadGeneratedVideo(job);
+    return;
+  } catch (error) {
+    const cancelled = job.cancelRequested || error?.code === 'GENERATION_CANCELLED';
+    job.status = cancelled ? 'cancelled' : 'failed';
+    job.error = cancelled ? '' : (error?.message || '生成失败');
+    job.message = cancelled ? '已取消生成' : '生成失败';
+    job.currentSong = '';
+    job.activeSongs.clear();
+    job.finishedAt = Date.now();
+    job.updatedAt = Date.now();
+    if (!cancelled) console.error(`[整单生成] ${job.source}:${job.playlistId} 失败:`, error);
+  } finally {
+    releaseProtectedSongCaches(job);
+    if (activePlaylistGenerationJobs.get(job.key) === job.id) {
+      activePlaylistGenerationJobs.delete(job.key);
+    }
+  }
+}
+
+function startNextPlaylistGenerationJob() {
+  if (playlistGenerationQueue.runningId) return;
+
+  let job = null;
+  while (!job && playlistGenerationQueue.length > 0) {
+    const jobId = playlistGenerationQueue.startNext();
+    const candidate = playlistGenerationJobs.get(jobId);
+    if (candidate && candidate.status === 'queued' && !candidate.cancelRequested) {
+      job = candidate;
+      break;
+    }
+    playlistGenerationQueue.finish(jobId);
+  }
+  if (!job) return;
+
+  const tokenStore = job.source === 'qq' ? qqUserOps : userOps;
+  const user = tokenStore.getById.get(job.userId);
+  if (!user) {
+    job.status = 'failed';
+    job.message = '生成失败';
+    job.error = '登录账号不存在或已失效';
+    job.finishedAt = Date.now();
+    job.updatedAt = Date.now();
+    if (activePlaylistGenerationJobs.get(job.key) === job.id) activePlaylistGenerationJobs.delete(job.key);
+    playlistGenerationQueue.finish(job.id);
+    setImmediate(startNextPlaylistGenerationJob);
+    return;
+  }
+
+  Promise.resolve().then(() => {
+    if (job.taskType === 'upload_only') return runUploadOnlyJob(job);
+    return runPlaylistGenerationJob(job, {
+      adapter: getSourceAdapter(job.source),
+      cookie: decrypt(user.cookie),
+      token: job.playbackToken
+    });
+  }).catch((error) => {
+    job.status = 'failed';
+    job.message = '生成失败';
+    job.error = error?.message || '启动生成任务失败';
+    job.finishedAt = Date.now();
+    job.updatedAt = Date.now();
+    if (activePlaylistGenerationJobs.get(job.key) === job.id) activePlaylistGenerationJobs.delete(job.key);
+    console.error(`[整单队列] ${job.source}:${job.playlistId} 启动失败:`, error);
+  }).finally(() => {
+    playlistGenerationQueue.finish(job.id);
+    setImmediate(startNextPlaylistGenerationJob);
+  });
+}
+
+function resolveAccountUserFromReq(req, source) {
+  const headerName = source === 'qq' ? 'x-qq-token' : 'x-token';
+  const accountToken = String(req.headers[headerName] || '').trim();
+  if (!accountToken) return null;
+  return (source === 'qq' ? qqUserOps : userOps).getByToken.get(accountToken) || null;
+}
+
+router.get('/generation-jobs', (req, res) => {
+  const source = getSourceFromReq(req);
+  const user = resolveAccountUserFromReq(req, source);
+  if (!user) return res.status(401).json({ success: false, message: '登录已失效' });
+
+  const ownedJobs = Array.from(playlistGenerationJobs.values())
+    .filter((job) => job.source === source && job.userId === user.id && !job.dismissedAt);
+  const activeJobs = ownedJobs
+    .filter(isGenerationJobActive)
+    .sort((left, right) => left.createdAt - right.createdAt);
+  const recentJobs = ownedJobs
+    .filter((job) => !isGenerationJobActive(job))
+    .sort((left, right) => right.createdAt - left.createdAt)
+    .slice(0, Math.max(0, 50 - activeJobs.length));
+  const jobs = [...activeJobs, ...recentJobs].map(generationJobSnapshot);
+
+  res.json({
+    success: true,
+    data: {
+      jobs,
+      runningJobId: playlistGenerationQueue.runningId,
+      queuedCount: jobs.filter((job) => job.status === 'queued').length
+    }
+  });
+});
+
+function findOwnedGenerationJob(req, res, source, user) {
+  const job = playlistGenerationJobs.get(String(req.params.jobId || ''));
+  if (!job || job.source !== source || job.userId !== user.id) {
+    res.status(404).json({ success: false, message: '生成任务不存在或已过期' });
+    return null;
+  }
+  return job;
+}
+
+function requestGenerationJobCancellation(job) {
+  if (job.status === 'queued') {
+    job.cancelRequested = true;
+    job.status = 'cancelled';
+    job.message = '已取消排队';
+    job.finishedAt = Date.now();
+    job.updatedAt = Date.now();
+    playlistGenerationQueue.remove(job.id);
+    if (activePlaylistGenerationJobs.get(job.key) === job.id) activePlaylistGenerationJobs.delete(job.key);
+    if (typeof job.resolveCancel === 'function') job.resolveCancel();
+    setImmediate(startNextPlaylistGenerationJob);
+  } else if (!['completed', 'failed', 'cancelled', 'uploading', 'resolving_link', 'upload_failed'].includes(job.status)) {
+    job.cancelRequested = true;
+    job.status = 'cancelling';
+    job.message = '正在取消生成';
+    job.updatedAt = Date.now();
+    if (typeof job.resolveCancel === 'function') job.resolveCancel();
+    for (const process of job.ffmpegProcesses) {
+      try { process.kill('SIGKILL'); } catch (_) {}
+    }
+  }
+}
+
+router.post('/generation-jobs/reupload', (req, res) => {
+  const source = getSourceFromReq(req);
+  const user = resolveAccountUserFromReq(req, source);
+  if (!user) return res.status(401).json({ success: false, message: '登录已失效' });
+  const historyJobId = String(req.body?.historyJobId || '').trim();
+  const history = generationHistoryOps.getOwned.get(historyJobId, source, user.id);
+  if (!history) return res.status(404).json({ success: false, message: '历史生成记录不存在' });
+
+  const outputPath = path.resolve(String(history.local_path || ''));
+  const relativePath = path.relative(path.resolve(PLAYLIST_MP4_DIR), outputPath);
+  if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    return res.status(400).json({ success: false, message: '历史记录中的本地视频路径无效' });
+  }
+  let stat;
+  try { stat = fs.statSync(outputPath); } catch (_) {}
+  if (!stat?.isFile() || stat.size <= 0) {
+    return res.status(404).json({ success: false, message: '本地视频文件不存在，无法重新上传' });
+  }
+
+  const key = `reupload:${source}:${user.id}:${historyJobId}`;
+  const activeId = activePlaylistGenerationJobs.get(key);
+  const activeJob = activeId ? playlistGenerationJobs.get(activeId) : null;
+  if (activeJob && isGenerationJobActive(activeJob)) {
+    return res.status(202).json({ success: true, data: generationJobSnapshot(activeJob) });
+  }
+
+  const id = crypto.randomUUID();
+  let resolveCancel;
+  const cancelSignal = new Promise((resolve) => { resolveCancel = resolve; });
+  const job = {
+    id,
+    key,
+    taskType: 'upload_only',
+    historyJobId,
+    source,
+    userId: user.id,
+    playlistId: String(history.playlist_id),
+    playlistName: String(history.playlist_name || '未命名歌单'),
+    playlistCover: String(history.playlist_cover || ''),
+    playlistCreator: String(history.playlist_creator || ''),
+    status: 'queued',
+    total: 1,
+    completed: 0,
+    skipped: 0,
+    skippedSongs: [],
+    activeSongs: new Map(),
+    ffmpegProcesses: new Set(),
+    cancelRequested: false,
+    cancelSignal,
+    resolveCancel,
+    concurrency: 1,
+    requestedConcurrency: 1,
+    currentSong: '',
+    message: '仅上传任务已进入队列',
+    error: '',
+    outputPath,
+    uploadStatus: 'waiting',
+    uploadPercent: 0,
+    uploadMessage: '等待开始上传',
+    uploadError: '',
+    publicUrl: String(history.public_url || ''),
+    shareUrl: '',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    statusPath: '',
+    cancelPath: ''
+  };
+  playlistGenerationJobs.set(id, job);
+  activePlaylistGenerationJobs.set(key, id);
+  playlistGenerationQueue.enqueue(id);
+  setImmediate(startNextPlaylistGenerationJob);
+  res.status(202).json({ success: true, data: generationJobSnapshot(job) });
+});
+
+router.post('/generation-jobs/:jobId/cancel', (req, res) => {
+  const source = getSourceFromReq(req);
+  const user = resolveAccountUserFromReq(req, source);
+  if (!user) return res.status(401).json({ success: false, message: '登录已失效' });
+  const job = findOwnedGenerationJob(req, res, source, user);
+  if (!job) return;
+  requestGenerationJobCancellation(job);
+  res.json({ success: true, data: generationJobSnapshot(job) });
+});
+
+router.post('/generation-jobs/:jobId/dismiss', (req, res) => {
+  const source = getSourceFromReq(req);
+  const user = resolveAccountUserFromReq(req, source);
+  if (!user) return res.status(401).json({ success: false, message: '登录已失效' });
+  const job = findOwnedGenerationJob(req, res, source, user);
+  if (!job) return;
+  if (!isGenerationJobTerminal(job)) {
+    return res.status(409).json({ success: false, message: '任务尚未结束，不能确认移除' });
+  }
+  job.dismissedAt = Date.now();
+  job.updatedAt = Date.now();
+  res.json({ success: true, data: { id: job.id, dismissed: true } });
+});
+
+router.post('/:token/:playlistId/generate', (req, res) => {
+  const { token, playlistId } = req.params;
+  const source = getSourceFromReq(req);
+  const profile = getRenderProfileFromReq(req);
+  const { mode, quality, resolution, fps, concurrency } = profile;
+  const order = getPlaybackOrderFromReq(req);
+  if (!isLikelyToken(token)) return res.status(400).json({ success: false, message: '无效的播放凭证' });
+  if (!isValidNumericId(playlistId)) return res.status(400).json({ success: false, message: '无效的歌单 ID' });
+  const user = resolveUserFromAccessToken(token, playlistId, source);
+  if (!user) return res.status(401).json({ success: false, message: '播放凭证已失效' });
+
+  const key = generationJobKey(source, user.id, playlistId, mode, quality, resolution, fps, order);
+  const activeId = activePlaylistGenerationJobs.get(key);
+  const activeJob = activeId ? playlistGenerationJobs.get(activeId) : null;
+  if (activeJob && isGenerationJobActive(activeJob)) {
+    return res.status(202).json({ success: true, data: generationJobSnapshot(activeJob) });
+  }
+
+  const id = crypto.randomUUID();
+  const cachedPlaylist = readCachedPlaylistDetail(playlistId, source);
+  let resolveCancel;
+  const cancelSignal = new Promise((resolve) => { resolveCancel = resolve; });
+  const job = {
+    id,
+    key,
+    source,
+    mode,
+    quality,
+    resolution,
+    fps,
+    requestedConcurrency: concurrency,
+    order,
+    userId: user.id,
+    playlistId: String(playlistId),
+    playlistName: String(cachedPlaylist?.name || req.body?.playlistName || `歌单 ${playlistId}`),
+    playlistCover: String(cachedPlaylist?.cover || req.body?.playlistCover || ''),
+    playlistCreator: String(cachedPlaylist?.creator || req.body?.playlistCreator || ''),
+    status: 'queued',
+    total: Number(cachedPlaylist?.songCount || req.body?.songCount) || 0,
+    completed: 0,
+    skipped: 0,
+    skippedSongs: [],
+    skippedIndexes: new Set(),
+    songProgress: 0,
+    activeSongs: new Map(),
+    ffmpegProcesses: new Set(),
+    cancelRequested: false,
+    cancelSignal,
+    resolveCancel,
+    concurrency: Math.min(concurrency, JOB_LIMITS.maxConcurrentJobs),
+    currentSong: '',
+    message: '任务已进入生成队列',
+    error: '',
+    uploadStatus: 'waiting',
+    uploadPercent: 0,
+    uploadMessage: '',
+    uploadError: '',
+    publicUrl: '',
+    shareUrl: '',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    playbackToken: token,
+    statusPath: generationStatusPath(source, token, playlistId, id),
+    cancelPath: generationCancelPath(source, token, playlistId, id)
+  };
+  playlistGenerationJobs.set(id, job);
+  activePlaylistGenerationJobs.set(key, id);
+  playlistGenerationQueue.enqueue(id);
+  setImmediate(startNextPlaylistGenerationJob);
+  res.status(202).json({ success: true, data: generationJobSnapshot(job) });
+});
+
+router.get('/:token/:playlistId/generate/:jobId', (req, res) => {
+  const { token, playlistId, jobId } = req.params;
+  const source = getSourceFromReq(req);
+  const user = resolveUserFromAccessToken(token, playlistId, source);
+  if (!user) return res.status(401).json({ success: false, message: '播放凭证已失效' });
+  const job = playlistGenerationJobs.get(jobId);
+  if (!job || job.source !== source || job.userId !== user.id || job.playlistId !== String(playlistId)) {
+    return res.status(404).json({ success: false, message: '生成任务不存在或已过期' });
+  }
+  res.json({ success: true, data: generationJobSnapshot(job) });
+});
+
+router.post('/:token/:playlistId/generate/:jobId/cancel', (req, res) => {
+  const { token, playlistId, jobId } = req.params;
+  const source = getSourceFromReq(req);
+  const user = resolveUserFromAccessToken(token, playlistId, source);
+  if (!user) return res.status(401).json({ success: false, message: '播放凭证已失效' });
+  const job = playlistGenerationJobs.get(jobId);
+  if (!job || job.source !== source || job.userId !== user.id || job.playlistId !== String(playlistId)) {
+    return res.status(404).json({ success: false, message: '生成任务不存在或已过期' });
+  }
+
+  requestGenerationJobCancellation(job);
+
+  res.json({ success: true, data: generationJobSnapshot(job) });
+});
+
+router.get('/:token/:playlistId/playlist.mp4', (req, res) => {
+  const { token, playlistId } = req.params;
+  const source = getSourceFromReq(req);
+  const profile = getRenderProfileFromReq(req);
+  const { mode, quality, resolution, fps } = profile;
+  const order = getPlaybackOrderFromReq(req);
+  if (!isLikelyToken(token)) return res.status(400).type('text/plain').send('Invalid token');
+  if (!isValidNumericId(playlistId)) return res.status(400).type('text/plain').send('Invalid playlist id');
+  const user = resolveUserFromAccessToken(token, playlistId, source);
+  if (!user) return res.status(401).type('text/plain').send('Token expired');
+
+  const cachedPlaylist = playlistOps.get.get(getPlaylistCacheKey(playlistId, source));
+  const playlistName = cachedPlaylist?.name || '';
+  const filePath = findPlaylistMp4Path(source, playlistId, mode, quality, playlistName, order, resolution, fps);
+  if (!fs.existsSync(filePath)) {
+    res.setHeader('Retry-After', '5');
+    return res.status(409).type('text/plain').send('Playlist MP4 is not generated yet');
+  }
+
+  const stat = fs.statSync(filePath);
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  const modeLabel = isFastGenerationMode(mode) ? '极速' : '标准';
+  const qualityLabel = { low: '低', medium: '中', high: '高' }[quality];
+  const downloadName = `${sanitizeOutputFileStem(playlistName, `playlist-${playlistId}`)}_${qualityLabel}_${modeLabel}_${resolution}_${fps}FPS.mp4`;
+  res.setHeader(
+    'Content-Disposition',
+    `inline; filename="playlist-${playlistId}.mp4"; filename*=UTF-8''${encodeURIComponent(downloadName)}`
+  );
+  const range = String(req.headers.range || '');
+  if (!range) {
+    res.setHeader('Content-Length', stat.size);
+    fs.createReadStream(filePath).pipe(res);
+    return;
+  }
+
+  const match = range.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) {
+    res.setHeader('Content-Range', `bytes */${stat.size}`);
+    return res.status(416).end();
+  }
+  const start = match[1] ? Number(match[1]) : 0;
+  const end = match[2] ? Number(match[2]) : stat.size - 1;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end >= stat.size) {
+    res.setHeader('Content-Range', `bytes */${stat.size}`);
+    return res.status(416).end();
+  }
+  res.status(206);
+  res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+  res.setHeader('Content-Length', end - start + 1);
+  fs.createReadStream(filePath, { start, end }).pipe(res);
+});
+
 // master playlist：为 yt-dlp / VRChat 提供 STREAM-INF 元信息
 router.get('/:token/:playlistId/master.m3u8', async (req, res) => {
   const { token, playlistId } = req.params;
   const source = getSourceFromReq(req);
+  const profile = getRenderProfileFromReq(req);
 
   if (!isLikelyToken(token)) {
     return res.status(400).send('#EXTM3U\n#EXT-X-ERROR:Invalid token format');
@@ -1131,15 +2317,16 @@ router.get('/:token/:playlistId/master.m3u8', async (req, res) => {
   res.send(
     '#EXTM3U\n' +
     '#EXT-X-VERSION:3\n' +
-    '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"\n' +
-    'stream.m3u8'
+    `#EXT-X-STREAM-INF:BANDWIDTH=3500000,RESOLUTION=${profile.width}x${profile.height},CODECS="avc1.640029,mp4a.40.2"\n` +
+    `stream.m3u8${getRenderQuerySuffix(profile.mode, profile.quality, profile.resolution, profile.fps)}`
   );
 });
 
 router.get('/:token/:playlistId/stream.m3u8', async (req, res) => {
   const { token, playlistId } = req.params;
   const source = getSourceFromReq(req);
-  const mode = getModeFromReq(req);
+  const profile = getRenderProfileFromReq(req);
+  const { mode, quality, resolution, fps } = profile;
   const adapter = getSourceAdapter(source);
   const startIndex = parseInt(req.query.start, 10) || 0;
   const playlistCacheKey = getPlaylistCacheKey(playlistId, source);
@@ -1184,12 +2371,13 @@ router.get('/:token/:playlistId/stream.m3u8', async (req, res) => {
     } else {
       playlistCover = cached.cover;
     }
-    const hasCover = Array.isArray(songs) && songs.some(s => s && s.cover);
-    if (!hasCover) {
+    const hasVisualMetadata = Array.isArray(songs) && songs.some(s => s && s.cover) && songs.some(s => s && s.album);
+    if (!hasVisualMetadata) {
       try {
         const playlist = await adapter.getPlaylistDetail(playlistId, cookie);
         songs = playlist.tracks;
         playlistCover = playlist.cover;
+        cachePlaylistDetail(playlistId, source, playlist);
       } catch (_) {
       }
     }
@@ -1198,6 +2386,7 @@ router.get('/:token/:playlistId/stream.m3u8', async (req, res) => {
       const playlist = await adapter.getPlaylistDetail(playlistId, cookie);
       songs = playlist.tracks;
       playlistCover = playlist.cover;
+      cachePlaylistDetail(playlistId, source, playlist);
     } catch (e) {
       return res.status(500).send('#EXTM3U\n#EXT-X-ERROR:Failed to get playlist');
     }
@@ -1208,10 +2397,19 @@ router.get('/:token/:playlistId/stream.m3u8', async (req, res) => {
   if (songs.length === 0) {
     return res.status(404).send('#EXTM3U\n#EXT-X-ERROR:Empty playlist');
   }
+
+  const missingSong = songs.find((song) => {
+    const songId = getSongIdForTrack(song, source);
+    return !isValidSongIdForSource(songId, source) || !isSongCached(getScopedSongCacheKey(songId, source, mode, quality, resolution, fps));
+  });
+  if (missingSong) {
+    res.setHeader('Retry-After', '5');
+    return res.status(409).send('#EXTM3U\n#EXT-X-ERROR:Playlist generation is not complete');
+  }
   
   const baseUrl = getBaseUrl(req);
   const segmentBasePath = getSegmentBasePathForReq(req, token, playlistId);
-  const modeSuffix = isLiteVideoMode(mode) ? '?mode=lite_video' : '';
+  const modeSuffix = getRenderQuerySuffix(mode, quality, resolution, fps);
   const segmentDuration = CACHE_CONFIG.segmentDuration;
   
   let m3u8 = '#EXTM3U\n';
@@ -1227,36 +2425,15 @@ router.get('/:token/:playlistId/stream.m3u8', async (req, res) => {
     if (!isValidSongIdForSource(songId, source)) {
       continue;
     }
-    const songCacheKey = getScopedSongCacheKey(songId, source, mode);
-    const songDuration = song.duration || 240;
-    
-    let segmentInfo = getSongSegmentInfo(songCacheKey);
-    
-    if (segmentInfo && segmentInfo.segmentDurations) {
-      if (songIndex > 0) {
-        m3u8 += '#EXT-X-DISCONTINUITY\n';
-      }
-      m3u8 += `#EXT-X-PROGRAM-DATE-TIME:${new Date().toISOString()}\n`;
-      
-      for (let segIndex = 0; segIndex < segmentInfo.segmentCount; segIndex++) {
-        const segDuration = segmentInfo.segmentDurations[segIndex] || segmentDuration;
-        m3u8 += `#EXTINF:${segDuration.toFixed(6)},\n`;
-        m3u8 += `${baseUrl}${segmentBasePath}/seg/${encodeURIComponent(songId)}/${segIndex}.ts${modeSuffix}\n`;
-      }
-    } else {
-      if (songIndex > 0) {
-        m3u8 += '#EXT-X-DISCONTINUITY\n';
-      }
-      
-      const estimatedSegments = Math.ceil(songDuration / segmentDuration);
-      for (let segIndex = 0; segIndex < estimatedSegments; segIndex++) {
-        const isLastSeg = segIndex === estimatedSegments - 1;
-        const segDur = isLastSeg 
-          ? (songDuration % segmentDuration) || segmentDuration 
-          : segmentDuration;
-        m3u8 += `#EXTINF:${segDur.toFixed(6)},\n`;
-        m3u8 += `${baseUrl}${segmentBasePath}/seg/${encodeURIComponent(songId)}/${segIndex}.ts${modeSuffix}\n`;
-      }
+    const songCacheKey = getScopedSongCacheKey(songId, source, mode, quality, resolution, fps);
+    const segmentInfo = getSongSegmentInfo(songCacheKey);
+    if (songIndex > 0) {
+      m3u8 += '#EXT-X-DISCONTINUITY\n';
+    }
+    for (let segIndex = 0; segIndex < segmentInfo.segmentCount; segIndex++) {
+      const segDuration = segmentInfo.segmentDurations[segIndex] || segmentDuration;
+      m3u8 += `#EXTINF:${segDuration.toFixed(6)},\n`;
+      m3u8 += `${baseUrl}${segmentBasePath}/seg/${encodeURIComponent(songId)}/${segIndex}.ts${modeSuffix}\n`;
     }
   }
   
@@ -1266,33 +2443,16 @@ router.get('/:token/:playlistId/stream.m3u8', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-cache');
   res.send(m3u8);
-  
-  let coverUrl = playlistCover || DEFAULT_COVER_URL;
-  if (isLiteVideoMode(mode)) {
-    const picked = await getOrBindBg({
-      token,
-      playlistId,
-      source,
-      fallbackUrl: coverUrl
-    });
-    const allowed = isDownloadUrlAllowed(picked);
-    coverUrl = allowed.allowed ? picked : coverUrl;
-  }
-
-  setImmediate(() => {
-    autoPreloadInBackground({ songs, cookie, coverUrl, playlistId, source, mode }).catch(e => {
-      console.error('[自动预加载] 错误:', e.message);
-    });
-  });
 });
 
 router.get('/:token/:playlistId/seg/:songId/:segmentIndex.ts', async (req, res) => {
   const { token, playlistId, songId, segmentIndex } = req.params;
   const source = getSourceFromReq(req);
-  const mode = getModeFromReq(req);
+  const profile = getRenderProfileFromReq(req);
+  const { mode, quality, resolution, fps } = profile;
   const adapter = getSourceAdapter(source);
   const playlistCacheKey = getPlaylistCacheKey(playlistId, source);
-  const songCacheKey = getScopedSongCacheKey(songId, source, mode);
+  const songCacheKey = getScopedSongCacheKey(songId, source, mode, quality, resolution, fps);
   const segIndex = parseInt(segmentIndex);
   
   if (!isLikelyToken(token)) {
@@ -1313,8 +2473,6 @@ router.get('/:token/:playlistId/seg/:songId/:segmentIndex.ts', async (req, res) 
     return res.status(401).json({ error: 'Invalid token' });
   }
   
-  const cookie = decrypt(user.cookie);
-
   if (segIndex === 0) {
     try {
       let songName = '未知';
@@ -1350,7 +2508,7 @@ router.get('/:token/:playlistId/seg/:songId/:segmentIndex.ts', async (req, res) 
   
   const segmentPath = getSegmentPath(songCacheKey, segIndex); 
 
-  const hitStat = await statIfValidSegment(segmentPath);
+  const hitStat = isSongCached(songCacheKey) ? await statIfValidSegment(segmentPath) : null;
   if (hitStat) { 
     if (LOG_VERBOSE) console.log(`[分片命中] ${songCacheKey}/${segIndex}`); 
 
@@ -1366,130 +2524,19 @@ router.get('/:token/:playlistId/seg/:songId/:segmentIndex.ts', async (req, res) 
     res.setHeader('Content-Length', hitStat.size); 
     const stream = fs.createReadStream(segmentPath); 
     stream.pipe(res); 
-     
-    if (segIndex === 0) { 
-      setImmediate(() => preloadNextSongs({ playlistId, currentSongId: songId, cookie, source, mode })); 
-    } 
     return; 
   } 
-  
-  const lockKey = songCacheKey;
-  if (generatingLocks.has(lockKey)) {
-    console.log(`[等待分片生成] ${songCacheKey}`);
-    try { 
-      await generatingLocks.get(lockKey); 
-      const generatedStat = await statIfValidSegment(segmentPath);
-      if (generatedStat) { 
-        const etag = makeWeakEtag(generatedStat);
-        res.setHeader('ETag', etag);
-        res.setHeader('Last-Modified', formatHttpDate(generatedStat.mtimeMs));
-        res.setHeader('Content-Length', generatedStat.size); 
-        const stream = fs.createReadStream(segmentPath); 
-        stream.pipe(res); 
- 
-        if (segIndex === 0) { 
-          setImmediate(() => preloadNextSongs({ playlistId, currentSongId: songId, cookie, source, mode }));
-        }
-        return;
-      }
-    } catch (e) {
-    }
-  }
-  
-  try {
-    const audioUrl = await adapter.getSongUrl(songId, cookie);
-    if (!audioUrl) {
-      return res.status(404).json({ error: 'Cannot get song URL' });
-    }
-    
-    let coverUrl = DEFAULT_COVER_URL;
-    const cached = playlistOps.get.get(playlistCacheKey);
-    let matchedSong = null;
-    if (cached) {
-      if (cached.cover) coverUrl = cached.cover;
-      try {
-        const songs = JSON.parse(cached.songs || '[]');
-        matchedSong = Array.isArray(songs) ? songs.find(s => getSongIdForTrack(s, source) === String(songId)) : null;
-        if (matchedSong && matchedSong.cover) coverUrl = matchedSong.cover;
-      } catch (_) {}
-    }
-
-    if (isLiteVideoMode(mode)) {
-      const picked = await getOrBindBg({
-        token,
-        playlistId,
-        source,
-        fallbackUrl: coverUrl
-      });
-      const allowed = isDownloadUrlAllowed(picked);
-      if (allowed.allowed) {
-        coverUrl = picked;
-      }
-    }
-    
-    if (LOG_VERBOSE) console.log(`[分片未命中] 生成歌曲所有分片: ${songCacheKey}`);
-    
-    const perSongCover = isLiteVideoMode(mode)
-      ? coverUrl
-      : pickCoverUrlForSong(matchedSong || { id: songId, cover: coverUrl }, coverUrl);
-    const generatePromise = generateSongSegments(songCacheKey, audioUrl, perSongCover);
-    generatePromise._createdAt = Date.now();
-    generatingLocks.set(lockKey, generatePromise);
-    
-    try {
-      await generatePromise;
-
-      const generatedStat = await statIfValidSegment(segmentPath);
-      if (generatedStat) {
-        const etag = makeWeakEtag(generatedStat);
-        res.setHeader('ETag', etag);
-        res.setHeader('Last-Modified', formatHttpDate(generatedStat.mtimeMs));
-        res.setHeader('Content-Length', generatedStat.size);
-        const stream = fs.createReadStream(segmentPath);
-
-        // 在 stream 完成或出错后才释放 lock，防止 cleanup 竞态删除正在读取的 segment
-        stream.on('close', () => generatingLocks.delete(lockKey));
-        stream.on('error', () => generatingLocks.delete(lockKey));
-        stream.pipe(res);
-
-        if (segIndex === 0) {
-          setImmediate(() => preloadNextSongs({ playlistId, currentSongId: songId, cookie, source, mode }));
-        }
-      } else {
-        generatingLocks.delete(lockKey);
-        throw new Error(`Segment ${segIndex} not found after generation`);
-      }
-    } catch (e) {
-      generatingLocks.delete(lockKey);
-      throw e;
-    }
-    
-  } catch (e) {
-    console.error('Segment error:', e);
-    if (!res.headersSent) {
-      if (e.message === '服务繁忙，请稍后重试') {
-        res.status(503).json({ 
-          error: e.message, 
-          retryAfter: 10,
-          queueInfo: {
-            running: jobSemaphore.running,
-            waiting: jobSemaphore.waiting,
-            maxConcurrent: JOB_LIMITS.maxConcurrentJobs
-          }
-        });
-      } else {
-        res.status(500).json({ error: e.message });
-      }
-    }
-  }
+  res.setHeader('Retry-After', '5');
+  return res.status(409).json({ error: 'Playlist generation is not complete' });
 });
 
 router.get('/:token/:playlistId/song/:songId.ts', (req, res) => {
   const { token, playlistId, songId } = req.params;
   const source = getSourceFromReq(req);
-  const mode = getModeFromReq(req);
+  const profile = getRenderProfileFromReq(req);
+  const { mode, quality, resolution, fps } = profile;
   const basePath = source === 'qq' ? '/api/qq/hls' : '/api/hls';
-  const modeSuffix = isLiteVideoMode(mode) ? '?mode=lite_video' : '';
+  const modeSuffix = getRenderQuerySuffix(mode, quality, resolution, fps);
   
   if (!isLikelyToken(token) || !isValidNumericId(playlistId) || !isValidSongIdForSource(songId, source)) {
     return res.status(400).json({ error: 'Invalid parameters' });
@@ -1501,7 +2548,8 @@ router.get('/:token/:playlistId/song/:songId.ts', (req, res) => {
 router.post('/:token/:playlistId/preload', async (req, res) => {
   const { token, playlistId } = req.params;
   const source = getSourceFromReq(req);
-  const mode = getModeFromReq(req);
+  const profile = getRenderProfileFromReq(req);
+  const { mode, quality, resolution, fps } = profile;
   const adapter = getSourceAdapter(source);
   const playlistCacheKey = getPlaylistCacheKey(playlistId, source);
   const count = Math.min(parseInt(req.body.count) || 5, 20);
@@ -1578,7 +2626,7 @@ router.post('/:token/:playlistId/preload', async (req, res) => {
         results.push({ id: songId, name: song.name, status: 'bad_song_id' });
         continue;
       }
-      const songCacheKey = getScopedSongCacheKey(songId, source, mode);
+      const songCacheKey = getScopedSongCacheKey(songId, source, mode, quality, resolution, fps);
       if (isSongCached(songCacheKey)) {
         const info = getSongSegmentInfo(songCacheKey);
         results.push({ id: songId, name: song.name, status: 'cached', segments: info?.segmentCount || 0 });
@@ -1586,14 +2634,17 @@ router.post('/:token/:playlistId/preload', async (req, res) => {
       }
       
       try {
-        const audioUrl = await adapter.getSongUrl(songId, cookie);
+        const [audioUrl, lyricsText] = await Promise.all([
+          adapter.getSongUrl(songId, cookie, quality),
+          adapter.getLyrics(songId, cookie)
+        ]);
         if (!audioUrl) {
           results.push({ id: songId, name: song.name, status: 'no_url' });
           continue;
         }
         
         const perSongCover = isLiteVideoMode(mode) ? coverUrl : pickCoverUrlForSong(song, coverUrl);
-        const info = await generateSongSegments(songCacheKey, audioUrl, perSongCover, song.duration);
+        const info = await generateSongSegments(songCacheKey, audioUrl, perSongCover, song.duration, song, lyricsText);
         results.push({ id: songId, name: song.name, status: 'generated', segments: info.segmentCount });
       } catch (e) {
         results.push({ id: songId, name: song.name, status: 'error', error: e.message });

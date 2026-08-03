@@ -14,6 +14,8 @@ const {
   isLegacyToken
 } = require('../lib/playback-token');
 const { auth } = require('../lib/auth');
+const { parseNeteaseSongId, createVirtualPlaylistId } = require('../lib/music-input');
+const { resolveGenerationProfile, buildGenerationQuery } = require('../lib/generation-profile');
 
 function isValidNumericId(id) {
   return typeof id === 'string' && /^\d+$/.test(id) && id.length <= 20;
@@ -174,7 +176,8 @@ router.get('/user', auth, async (req, res) => {
 
 router.get('/parse', auth, async (req, res) => {
   const input = req.query.url;
-  const playlistId = parsePlaylistId(input);
+  const songId = parseNeteaseSongId(input);
+  const playlistId = songId ? createVirtualPlaylistId('netease', songId) : parsePlaylistId(input);
 
   if (!playlistId || !isValidNumericId(playlistId)) {
     return res.status(400).json({ success: false, message: '无效的歌单链接或ID' });
@@ -199,17 +202,26 @@ router.get('/parse', auth, async (req, res) => {
     }
 
     const cookie = decrypt(req.user.cookie);
-    const playlist = await netease.getPlaylistDetail(playlistId, cookie);
+    const playlist = songId
+      ? (() => netease.getSongDetail(songId, cookie).then((track) => ({
+          id: playlistId,
+          name: track.name,
+          cover: track.cover,
+          songCount: 1,
+          tracks: [track]
+        })))()
+      : await netease.getPlaylistDetail(playlistId, cookie);
+    const resolvedPlaylist = await playlist;
 
     const ttlSec = parseInt(process.env.CACHE_TTL) || 86400;
     const expiresAt = toSqliteDatetime(new Date(Date.now() + ttlSec * 1000));
 
     playlistOps.set.run({
       playlist_id: String(playlistId),
-      name: playlist.name || '',
-      cover: playlist.cover || '',
-      song_count: playlist.songCount || 0,
-      songs: JSON.stringify(playlist.tracks || []),
+      name: resolvedPlaylist.name || '',
+      cover: resolvedPlaylist.cover || '',
+      song_count: resolvedPlaylist.songCount || 0,
+      songs: JSON.stringify(resolvedPlaylist.tracks || []),
       expires_at: expiresAt
     });
 
@@ -217,9 +229,10 @@ router.get('/parse', auth, async (req, res) => {
       success: true,
       data: {
         id: String(playlistId),
-        name: playlist.name,
-        cover: playlist.cover,
-        songCount: playlist.songCount
+        name: resolvedPlaylist.name,
+        cover: resolvedPlaylist.cover,
+        songCount: resolvedPlaylist.songCount,
+        inputType: songId ? 'song' : 'playlist'
       }
     });
   } catch (e) {
@@ -230,6 +243,9 @@ router.get('/parse', auth, async (req, res) => {
 
 router.get('/url', auth, (req, res) => {
   const playlistId = String(req.query.id || '');
+  const order = String(req.query.order || '').toLowerCase() === 'shuffle' ? 'shuffle' : 'sequential';
+  const profile = resolveGenerationProfile(req.query);
+  const { mode, quality, resolution, fps, concurrency } = profile;
 
   if (!isValidNumericId(playlistId)) {
     return res.status(400).json({ success: false, message: '无效的歌单ID' });
@@ -240,51 +256,21 @@ router.get('/url', auth, (req, res) => {
     playlistId
   });
 
-  const baseUrl = getBaseUrl(req);
-  const hlsUrl = `${baseUrl}/api/hls/${encodeURIComponent(playbackToken)}/${playlistId}/master.m3u8`;
-  const liteUrl = `${baseUrl}/api/playlist/m3u8/${encodeURIComponent(playbackToken)}/${playlistId}/stream.m3u8`;
+  const generationQuery = buildGenerationQuery({ order, mode, quality, resolution, fps, concurrency });
+  const generationPath = `/api/playlist-video/${encodeURIComponent(playbackToken)}/${playlistId}/generate${generationQuery}`;
 
   res.json({
     success: true,
     data: {
-      url: liteUrl,
-      urls: [
-        {
-          type: 'lite',
-          label: '轻量 M3U8（仅音频）',
-          url: liteUrl,
-          note: '无需转码，即时播放。VRChat 可能不支持，建议在支持 HLS 直播流的播放器中使用。'
-        },
-        {
-          type: 'hls',
-          label: 'HLS 转码',
-          url: hlsUrl,
-          note: 'VRChat 兼容性最佳，带封面视频。首次播放需等待转码，后续自动缓存。'
-        }
-      ],
-      default: 'lite'
+      generationPath,
+      order,
+      mode,
+      quality,
+      resolution,
+      fps,
+      concurrency
     }
   });
-
-  const preloadParam = String(req.query.preload || '').toLowerCase();
-  const doPreload = preloadParam === '1' || preloadParam === 'true';
-  if (!doPreload) return;
-
-  try {
-    const token = playbackToken;
-    const port = process.env.PORT || 3000;
-    const preloadBase = process.env.PRELOAD_BASE_URL || `http://127.0.0.1:${port}`;
-
-    setImmediate(() => {
-      try {
-        fetch(`${preloadBase}/api/hls/${encodeURIComponent(token)}/${encodeURIComponent(playlistId)}/preload`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ count: 1 })
-        }).catch(() => {});
-      } catch (_) {}
-    });
-  } catch (_) {}
 });
 
 module.exports = router;

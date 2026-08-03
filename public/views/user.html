@@ -10,6 +10,22 @@
     <button class="profile-platform-tab" id="personalPlatformQQ" onclick="switchPersonalPlatform('qq')">QQ音乐个人中心</button>
   </div>
 
+  <section class="tmplink-settings" id="tmplinkSettings">
+    <div class="tmplink-settings-head">
+      <div>
+        <h3>公开链接上传（TMPLINK）</h3>
+        <p id="tmplinkSettingsHint">生成完成后自动上传视频并获取公开直链。<button class="tmplink-help-link" type="button" onclick="showTmplinkHelp()">怎么获取 Token？</button></p>
+      </div>
+      <span class="tmplink-account-source" id="tmplinkAccountSource">网易云账号</span>
+    </div>
+    <div class="tmplink-token-row">
+      <input id="tmplinkTokenInput" type="password" maxlength="8192" autocomplete="off" placeholder="输入 TMPLINK Token">
+      <button class="btn btn-primary" id="saveTmplinkTokenBtn" type="button" onclick="saveTmplinkToken()">验证并保存</button>
+      <button class="btn btn-ghost" id="removeTmplinkTokenBtn" type="button" onclick="removeTmplinkToken()" hidden>移除</button>
+    </div>
+    <div class="tmplink-settings-status" id="tmplinkSettingsStatus">登录音乐账号后可配置</div>
+  </section>
+
   <section id="neteasePanel" class="platform-panel active">
     <div id="neteaseAuthState" class="platform-auth-state"></div>
     <div id="neteaseContent">

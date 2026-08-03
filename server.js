@@ -5,10 +5,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const compression = require('compression');
-const crypto = require('crypto');
 const path = require('path');
-const rateLimit = require('express-rate-limit');
-const { ipKeyGenerator } = rateLimit;
+const { getKey } = require('./lib/crypto');
+const { createSiteAccess } = require('./lib/site-access');
 require('./lib/db');
 
 const app = express();
@@ -21,10 +20,10 @@ if (trustProxy !== undefined && trustProxy !== null && String(trustProxy).trim()
   const normalized = String(trustProxy).trim();
 
   if (normalized === 'false' || normalized === '0') {
-    console.warn(`[WARN] TRUST_PROXY=${normalized} 会触发 express-rate-limit 的 X-Forwarded-For 校验错误，已按安全默认值 trust proxy=loopback 处理；如需正确识别真实 IP，请设置 TRUST_PROXY=1/2/3... 或指定代理 IP/子网。`);
+    proxyValue = false;
   } else if (normalized === 'true') {
     proxyValue = 1;
-    console.warn('[WARN] TRUST_PROXY=true 不安全且会导致限流报错，已自动改用 TRUST_PROXY=1；请按实际代理层数设置 TRUST_PROXY=1/2/3... 或指定代理 IP/子网。');
+    console.warn('[WARN] TRUST_PROXY=true 会信任所有代理，已自动改用 TRUST_PROXY=1；请按实际代理层数设置 TRUST_PROXY=1/2/3... 或指定代理 IP/子网。');
   } else if (/^\d+$/.test(normalized)) {
     proxyValue = parseInt(normalized, 10);
   } else {
@@ -46,188 +45,143 @@ app.use(compression({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const globalLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_GLOBAL) || 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: '请求过于频繁，请稍后再试' }
-});
-
-const authLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_AUTH) || 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: '登录尝试过于频繁，请稍后再试' }
-});
-
-const parseLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_PARSE) || 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: '解析请求过于频繁，请稍后再试' }
-});
-
-function getHlsTokenFromPath(req) {
-  const p = String(req.path || '');
-  const m = p.match(/^\/([^/]+)\//);
-  return m ? m[1] : '';
-}
-
-function hlsKey(req) {
-  const token = getHlsTokenFromPath(req);
-  return `${ipKeyGenerator(req)}:${token}`;
-}
-
-const hlsStreamLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_HLS_STREAM) || 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => !String(req.path || '').endsWith('stream.m3u8'),
-  keyGenerator: hlsKey,
-  handler: (req, res) => {
-    res.status(429);
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.send('#EXTM3U\n#EXT-X-ERROR:Rate limit exceeded');
-  }
-});
-
-const hlsSegmentLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_HLS_SEGMENT) || 600,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => !String(req.path || '').endsWith('.ts'),
-  keyGenerator: hlsKey,
-  handler: (req, res) => {
-    res.status(429).type('text/plain').send('Rate limit exceeded');
-  }
-});
-
-const mp4Limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_MP4) || 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: 'MP4 请求过于频繁，请稍后再试' }
-});
-
-app.use('/api/', globalLimiter);
-
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: Date.now() });
 });
 
-if (process.env.SITE_PASSWORD) {
-  const SITE_COOKIE_NAME = 'site_auth';
-  const SITE_COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const SITE_COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const siteAccess = createSiteAccess({ cookieSigningKey: getKey() });
 
-  function parseCookies(cookieHeader) {
-    const out = {};
-    if (!cookieHeader) return out;
-    const parts = String(cookieHeader).split(';');
-    for (const part of parts) {
-      const idx = part.indexOf('=');
-      if (idx === -1) continue;
-      const k = part.slice(0, idx).trim();
-      const v = part.slice(idx + 1).trim();
-      if (!k) continue;
-      out[k] = decodeURIComponent(v);
-    }
-    return out;
+function parseCookies(cookieHeader) {
+  const out = {};
+  if (!cookieHeader) return out;
+  const parts = String(cookieHeader).split(';');
+  for (const part of parts) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (!key) continue;
+    try { out[key] = decodeURIComponent(value); } catch (_) { out[key] = value; }
   }
+  return out;
+}
 
-  function signSiteCookieValue(password) {
-    return crypto.createHmac('sha256', password).update('site-auth-v1').digest('hex');
-  }
-
-  const expectedCookieValue = signSiteCookieValue(process.env.SITE_PASSWORD);
-
-  function isPublicAssetPath(p) {
-    if (p === '/password.html') return true;
-    if (p === '/placeholder.svg' || p === '/favicon.ico') return true;
-    if (p.startsWith('/css/') || p.startsWith('/js/') || p.startsWith('/includes/')) return true;
-    return false;
-  }
-
-  app.use((req, res, next) => {
-    if (req.path.startsWith('/api/playlist/') && req.path.endsWith('.m3u8')) {
-      return next();
-    }
-    if (req.path.startsWith('/api/song/')) {
-      return next();
-    }
-    if (req.path.startsWith('/api/hls/') && !req.path.startsWith('/api/hls/cache')) {
-      return next();
-    }
-    if (req.path.startsWith('/api/qq/hls/') && !req.path.startsWith('/api/qq/hls/cache')) {
-      return next();
-    }
-    if (req.path.startsWith('/api/mp4/')) {
-      return next();
-    }
-    if (req.path.startsWith('/api/qq/mp4/')) {
-      return next();
-    }
-
-    if (req.path.startsWith('/api/qq/song/')) {
-      return next();
-    }
-    if (req.path.startsWith('/api/qq/playlist/m3u8/') && req.path.endsWith('.m3u8')) {
-      return next();
-    }
-
-    if (isPublicAssetPath(req.path)) {
-      return next();
-    }
-
-    const cookies = parseCookies(req.headers.cookie);
-    if (cookies[SITE_COOKIE_NAME] && cookies[SITE_COOKIE_NAME] === expectedCookieValue) {
-      return next();
-    }
-    
-    const provided = req.headers['x-site-password'] || req.query.sitePassword;
-    if (provided !== process.env.SITE_PASSWORD) {
-      if (req.accepts('html') && !req.path.startsWith('/api/')) {
-        return res.sendFile(path.join(__dirname, 'public', 'password.html'));
-      }
-      return res.status(401).json({ success: false, message: '需要站点密码' });
-    }
-
-    res.cookie(SITE_COOKIE_NAME, expectedCookieValue, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: req.secure,
-      maxAge: SITE_COOKIE_MAX_AGE_MS
-    });
-
-    next();
+function setSiteAccessCookie(req, res) {
+  res.cookie(siteAccess.cookieName, siteAccess.cookieValue(), {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: req.secure,
+    maxAge: SITE_COOKIE_MAX_AGE_MS
   });
 }
 
+function isPublicAssetPath(p) {
+  if (p === '/password.html') return true;
+  if (p === '/placeholder.svg' || p === '/favicon.ico') return true;
+  if (p === '/css/style.css' || p === '/css/password.css' || p === '/js/password.js' || p === '/js/error-utils.js') return true;
+  return false;
+}
+
+function isPublicPlaybackPath(p) {
+  if (p.startsWith('/api/playlist/') && p.endsWith('.m3u8')) return true;
+  if (p.startsWith('/api/song/')) return true;
+  if (p.startsWith('/api/hls/') && !p.startsWith('/api/hls/cache')) return true;
+  if (p.startsWith('/api/qq/hls/') && !p.startsWith('/api/qq/hls/cache')) return true;
+  if (p.startsWith('/api/mp4/') || p.startsWith('/api/qq/mp4/')) return true;
+  if (p.startsWith('/api/playlist-video/') || p.startsWith('/api/qq/playlist-video/')) return true;
+  if (p.startsWith('/api/qq/song/')) return true;
+  if (p.startsWith('/api/qq/playlist/m3u8/') && p.endsWith('.m3u8')) return true;
+  return false;
+}
+
+app.get('/api/site-access/status', (req, res) => {
+  const cookies = parseCookies(req.headers.cookie);
+  res.json({
+    success: true,
+    configured: siteAccess.configured(),
+    authenticated: siteAccess.isCookieValid(cookies[siteAccess.cookieName]),
+    source: siteAccess.source(),
+    minSecretLength: siteAccess.minSecretLength
+  });
+});
+
+app.post('/api/site-access/setup', (req, res) => {
+  try {
+    const secret = String(req.body?.secret || '');
+    siteAccess.setup(secret);
+    setSiteAccessCookie(req, res);
+    res.status(201).json({ success: true, message: '后台密钥设置成功' });
+  } catch (error) {
+    if (error?.code === 'ALREADY_CONFIGURED') {
+      return res.status(409).json({ success: false, message: error.message });
+    }
+    res.status(400).json({ success: false, message: error?.message || '后台密钥设置失败' });
+  }
+});
+
+app.post('/api/site-access/login', (req, res) => {
+  if (!siteAccess.configured()) {
+    return res.status(428).json({ success: false, message: '请先设置后台密钥' });
+  }
+  const secret = String(req.body?.secret || req.headers['x-site-password'] || '');
+  if (!siteAccess.verify(secret)) {
+    return res.status(401).json({ success: false, message: '后台密钥错误' });
+  }
+  setSiteAccessCookie(req, res);
+  res.json({ success: true, message: '登录成功' });
+});
+
+app.post('/api/site-access/logout', (req, res) => {
+  res.clearCookie(siteAccess.cookieName, { httpOnly: true, sameSite: 'lax', secure: req.secure });
+  res.json({ success: true });
+});
+
+app.use((req, res, next) => {
+  if (req.path === '/health' || req.path.startsWith('/api/site-access/')) return next();
+  if (isPublicPlaybackPath(req.path) || isPublicAssetPath(req.path)) return next();
+
+  const cookies = parseCookies(req.headers.cookie);
+  if (siteAccess.isCookieValid(cookies[siteAccess.cookieName])) return next();
+
+  // 兼容旧客户端：携带环境变量 SITE_PASSWORD 时仍可换取登录 Cookie。
+  const provided = req.headers['x-site-password'] || req.query.sitePassword;
+  if (provided && siteAccess.verify(provided)) {
+    setSiteAccessCookie(req, res);
+    return next();
+  }
+
+  if (req.accepts('html') && !req.path.startsWith('/api/')) {
+    return res.sendFile(path.join(__dirname, 'public', 'password.html'));
+  }
+
+  const status = siteAccess.configured() ? 401 : 428;
+  return res.status(status).json({
+    success: false,
+    configured: siteAccess.configured(),
+    message: siteAccess.configured() ? '需要后台密钥登录' : '请先设置后台密钥'
+  });
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.use('/api/auth/login', authLimiter);
-app.use('/api/auth/captcha', authLimiter);
 app.use('/api/auth', require('./routes/auth'));
-app.use('/api/playlist/parse', parseLimiter);
 app.use('/api/playlist', require('./routes/playlist'));
 
 app.use('/api/song', require('./routes/song'));
 app.use('/api/img', require('./routes/img'));
-app.use('/api/hls', hlsStreamLimiter, hlsSegmentLimiter, require('./routes/hls'));
-app.use('/api/qq/hls', hlsStreamLimiter, hlsSegmentLimiter, require('./routes/hls'));
-app.use('/api/mp4', mp4Limiter, require('./routes/mp4'));
-app.use('/api/qq/mp4', mp4Limiter, require('./routes/mp4'));
+app.use('/api/hls', require('./routes/hls'));
+app.use('/api/qq/hls', require('./routes/hls'));
+app.use('/api/playlist-video', require('./routes/hls'));
+app.use('/api/qq/playlist-video', require('./routes/hls'));
+app.use('/api/mp4', require('./routes/mp4'));
+app.use('/api/qq/mp4', require('./routes/mp4'));
 app.use('/api/favorites', require('./routes/favorite'));
 app.use('/api/history', require('./routes/history'));
+app.use('/api/upload-settings', require('./routes/upload-settings'));
+app.use('/api/generation-history', require('./routes/generation-history'));
 
-app.use('/api/qq/auth/login', authLimiter);
 app.use('/api/qq/auth', require('./routes/qq-auth'));
-app.use('/api/qq/playlist/parse', parseLimiter);
 app.use('/api/qq/playlist', require('./routes/qq-playlist'));
 app.use('/api/qq/favorites', require('./routes/qq-favorite'));
 app.use('/api/qq/history', require('./routes/qq-history'));

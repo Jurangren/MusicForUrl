@@ -8,10 +8,59 @@
 <!-- Input Section -->
 <div class="input-section">
   <div class="input-group">
-    <input type="text" id="playlistInput" placeholder="粘贴网易云歌单链接或ID">
+    <input type="text" id="playlistInput" placeholder="粘贴网易云歌单/单曲链接或歌单ID">
     <button class="btn btn-primary" id="generateBtn" onclick="generatePlaylist()">生成</button>
   </div>
+  <div class="generation-order" role="radiogroup" aria-label="播放顺序">
+    <span>播放顺序</span>
+    <label><input type="radio" name="generationOrder" value="sequential" checked><span>按歌单顺序</span></label>
+    <label><input type="radio" name="generationOrder" value="shuffle"><span>随机顺序</span></label>
+  </div>
+  <div class="generation-mode" role="radiogroup" aria-label="生成模式">
+    <span>生成模式</span>
+    <label><input type="radio" name="generationMode" value="default" onchange="syncGenerationOptionAvailability()"><span>标准生成</span></label>
+    <label><input type="radio" name="generationMode" value="fast" checked onchange="syncGenerationOptionAvailability()"><span>极速生成</span></label>
+  </div>
+  <div class="generation-quality" role="radiogroup" aria-label="输出音质">
+    <span>输出音质</span>
+    <label><input type="radio" name="generationQuality" value="low"><span>低音质</span></label>
+    <label><input type="radio" name="generationQuality" value="medium"><span>中音质</span></label>
+    <label><input type="radio" name="generationQuality" value="high" checked><span>高音质</span></label>
+  </div>
+  <div class="generation-resolution" role="radiogroup" aria-label="输出分辨率">
+    <span>输出分辨率</span>
+    <label><input type="radio" name="generationResolution" value="1600x900"><span>1600×900</span></label>
+    <label><input type="radio" name="generationResolution" value="1920x1080" checked><span>1920×1080</span></label>
+  </div>
+  <div class="generation-fps" role="radiogroup" aria-label="输出帧率">
+    <span>输出帧率</span>
+    <label><input type="radio" name="generationFps" value="5"><span>5 FPS</span></label>
+    <label><input type="radio" name="generationFps" value="10"><span>10 FPS</span></label>
+    <label><input type="radio" name="generationFps" value="15" checked><span>15 FPS</span></label>
+    <label><input type="radio" name="generationFps" value="30" data-standard-only><span>30 FPS</span></label>
+    <strong class="fast-fps-notice" id="fastFpsNotice" hidden>1 FPS（极速模式固定）</strong>
+  </div>
+  <div class="generation-concurrency" role="radiogroup" aria-label="生成并发数">
+    <span>生成并发</span>
+    <label><input type="radio" name="generationConcurrency" value="2" onchange="confirmHighConcurrencySelection(this)"><span>2</span></label>
+    <label><input type="radio" name="generationConcurrency" value="4" checked onchange="confirmHighConcurrencySelection(this)"><span>4</span></label>
+    <label><input type="radio" name="generationConcurrency" value="6" onchange="confirmHighConcurrencySelection(this)"><span>6</span></label>
+    <label><input type="radio" name="generationConcurrency" value="8" onchange="confirmHighConcurrencySelection(this)"><span>8</span></label>
+    <label><input type="radio" name="generationConcurrency" value="16" onchange="confirmHighConcurrencySelection(this)"><span>16</span></label>
+  </div>
 </div>
+
+<!-- Server-backed generation queue. It survives browser refreshes. -->
+<section class="generation-queue" id="generationQueuePanel" hidden aria-live="polite">
+  <div class="generation-queue-header">
+    <div>
+      <h2>生成任务</h2>
+      <p>歌单按加入顺序逐个生成，刷新页面不会中断</p>
+    </div>
+    <span class="generation-queue-summary" id="generationQueueSummary"></span>
+  </div>
+  <div class="generation-queue-list" id="generationQueueList"></div>
+</section>
 
 <!-- Result Section -->
 <div class="result-section" id="resultSection">
@@ -22,9 +71,47 @@
       <div class="playlist-meta" id="playlistMeta"></div>
     </div>
   </div>
+  <div class="generation-progress" id="generationProgress" aria-live="polite">
+    <div class="generation-progress-head">
+      <span id="generationStatus">准备生成</span>
+      <strong id="generationPercent">0%</strong>
+    </div>
+    <div class="generation-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="generation-progress-bar" id="generationProgressBar"></div>
+    </div>
+    <div class="generation-progress-detail">
+      <span id="generationCurrentSong">正在读取歌单…</span>
+      <span id="generationCount">0 / 0</span>
+    </div>
+    <div class="generation-progress-timing">
+      <span>已用时间 <strong id="generationElapsed">00:00</strong></span>
+      <span>预计还需 <strong id="generationEta">计算中…</strong></span>
+    </div>
+    <div class="generation-progress-actions">
+      <button class="btn generation-cancel-btn" id="cancelGenerationBtn" type="button" onclick="cancelGeneration()" hidden>取消生成</button>
+    </div>
+  </div>
+  <div class="generated-skipped-songs" id="generatedSkippedSongs" hidden>
+    <strong id="generatedSkippedSongsTitle">已跳过不可播放歌曲</strong>
+    <ul id="generatedSkippedSongsList"></ul>
+  </div>
+  <div class="generated-local-path" id="generatedLocalPath" hidden>
+    <span>本地文件路径</span>
+    <code id="generatedLocalPathValue"></code>
+  </div>
+  <div class="upload-progress" id="uploadProgress" hidden aria-live="polite">
+    <div class="generation-progress-head">
+      <span id="uploadStatus">正在上传获取公开链接</span>
+      <strong id="uploadPercent">0%</strong>
+    </div>
+    <div class="generation-progress-track" id="uploadProgressTrack" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="generation-progress-bar" id="uploadProgressBar"></div>
+    </div>
+    <div class="upload-progress-message" id="uploadProgressMessage">正在准备上传视频</div>
+  </div>
   <div class="url-options" id="playlistUrlOptions"></div>
-  <div class="action-buttons">
+  <div class="action-buttons" id="generatedActions">
     <button class="btn btn-primary" onclick="copyUrl()">复制链接</button>
-    <button class="btn btn-ghost" id="favoriteBtn">收藏</button>
+    <button class="btn btn-ghost" onclick="openGeneratedUrl()">打开链接</button>
   </div>
 </div>

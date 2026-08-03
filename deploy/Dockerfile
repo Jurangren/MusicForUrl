@@ -37,7 +37,7 @@ RUN if [ -n "$ALPINE_REPO_MIRROR" ]; then \
       m="${m#https://}"; \
       sed -i "s|dl-cdn.alpinelinux.org/alpine|$m|g" /etc/apk/repositories; \
     fi \
-  && apk add --no-cache ffmpeg
+  && apk add --no-cache ffmpeg font-noto-cjk
 
 WORKDIR /app
 

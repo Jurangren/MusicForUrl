@@ -11,6 +11,9 @@ const qqmusic = require('../lib/qqmusic');
 const { decrypt } = require('../lib/crypto');
 const { userOps, qqUserOps, playlistOps, playLogOps } = require('../lib/db');
 const { verifyPlaybackToken, isLegacyToken } = require('../lib/playback-token');
+const { createTextAssets, removeTextAssets, buildVisualFilter } = require('../lib/video-visual');
+const { createLyricsAss } = require('../lib/lyrics');
+const { detectVideoEncoder } = require('../lib/video-encoder');
 
 // ─── 工具函数 ──────────────────────────────────────────────
 
@@ -44,6 +47,7 @@ function getSourceAdapter(source) {
     return {
       source: 'qq',
       getSongUrl: (songId, cookie) => qqmusic.getSongUrl(String(songId), cookie),
+      getLyrics: (songId, cookie) => qqmusic.getLyrics(String(songId), cookie),
       getPlaylistDetail: (playlistId, cookie) => qqmusic.getPlaylistDetail(String(playlistId), cookie),
       toPlayLogPlaylistId: (playlistId) => `qq:${String(playlistId)}`,
       toPlayLogSongId: (songId) => `qq:${String(songId)}`
@@ -52,6 +56,7 @@ function getSourceAdapter(source) {
   return {
     source: 'netease',
     getSongUrl: (songId, cookie) => netease.getSongUrl(String(songId), cookie),
+    getLyrics: (songId, cookie) => netease.getLyrics(String(songId), cookie),
     getPlaylistDetail: (playlistId, cookie) => netease.getPlaylistDetail(String(playlistId), cookie),
     toPlayLogPlaylistId: (playlistId) => String(playlistId),
     toPlayLogSongId: (songId) => String(songId)
@@ -93,9 +98,11 @@ const DEFAULT_COVER_URL =
   'https://p1.music.126.net/6y-UleORITEDbvrOLV0Q8A==/5639395138885805.jpg';
 
 const COVER_OUTPUT = {
-  width: parseInt(process.env.COVER_WIDTH) || 1920,
-  height: parseInt(process.env.COVER_HEIGHT) || 1080
+  width: Math.max(640, parseInt(process.env.COVER_WIDTH, 10) || 1920),
+  height: Math.max(360, parseInt(process.env.COVER_HEIGHT, 10) || 1080)
 };
+
+const VIDEO_VISUAL_FPS = Math.max(5, Math.min(30, parseInt(process.env.VIDEO_VISUAL_FPS || process.env.COVER_FPS, 10) || 5));
 
 function optimizeNeteaseCoverUrl(rawUrl, size = 1080) {
   const url = (rawUrl == null) ? '' : String(rawUrl).trim();
@@ -128,7 +135,7 @@ if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
 
-const MP4_CACHE_VERSION = 1;
+const MP4_CACHE_VERSION = 14;
 
 function getMp4CacheKey(songId, source) {
   const src = source === 'qq' ? 'qq' : 'netease';
@@ -149,6 +156,35 @@ function getMp4FilePath(mp4CacheKey) {
 
 function getMp4InfoPath(mp4CacheKey) {
   return path.join(getMp4CacheDir(mp4CacheKey), 'info.json');
+}
+
+function cachePlaylistDetail(playlistId, source, playlist) {
+  if (!playlist) return;
+  const ttlSec = parseInt(process.env.CACHE_TTL, 10) || 86400;
+  const expiresAt = new Date(Date.now() + ttlSec * 1000).toISOString().slice(0, 19).replace('T', ' ');
+  playlistOps.set.run({
+    playlist_id: getPlaylistCacheKey(playlistId, source),
+    name: playlist.name || '',
+    cover: playlist.cover || '',
+    song_count: playlist.songCount || playlist.tracks?.length || 0,
+    songs: JSON.stringify(playlist.tracks || []),
+    expires_at: expiresAt
+  });
+}
+
+function isMp4Cached(mp4CacheKey) {
+  try {
+    const filePath = getMp4FilePath(mp4CacheKey);
+    const infoPath = getMp4InfoPath(mp4CacheKey);
+    if (!fs.existsSync(filePath) || !fs.existsSync(infoPath)) return false;
+    const info = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
+    return info.version === MP4_CACHE_VERSION &&
+      info.video?.width === COVER_OUTPUT.width &&
+      info.video?.height === COVER_OUTPUT.height &&
+      fs.statSync(filePath).size > 1024;
+  } catch (_) {
+    return false;
+  }
 }
 
 // ─── 并发控制 ──────────────────────────────────────────────
@@ -399,16 +435,17 @@ function findFFmpeg() {
 }
 
 const FFMPEG_PATH = findFFmpeg();
+const VIDEO_ENCODER = detectVideoEncoder(FFMPEG_PATH);
 
 // ─── MP4 生成（封面 + 音频 copy）──────────────────────────
 
-async function generateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration) {
+async function generateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration, track = {}, lyricsText = '') {
   // 检查是否已在生成中
   if (generatingLocks.has(mp4CacheKey)) {
     return generatingLocks.get(mp4CacheKey);
   }
 
-  const promise = _doGenerateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration);
+  const promise = _doGenerateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration, track, lyricsText);
   generatingLocks.set(mp4CacheKey, promise);
 
   try {
@@ -419,7 +456,7 @@ async function generateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration) {
   }
 }
 
-async function _doGenerateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration) {
+async function _doGenerateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration, track = {}, lyricsText = '') {
   const acquired = await jobSemaphore.acquire();
   if (!acquired) {
     throw new Error('服务繁忙，请稍后重试');
@@ -433,11 +470,22 @@ async function _doGenerateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration) {
   const cacheDir = getMp4CacheDir(mp4CacheKey);
   const destMp4 = getMp4FilePath(mp4CacheKey);
   const destInfo = getMp4InfoPath(mp4CacheKey);
+  const visualBase = path.join(TEMP_DIR, `${safeTempKey}_${timestamp}`);
+  const textAssets = createTextAssets(visualBase, track, '', COVER_OUTPUT);
+  const lyricsFile = `${visualBase}_lyrics.ass`;
+  const effectiveDuration = Math.max(1, Number(songDuration) || Number(track.duration) || 240);
+  createLyricsAss(lyricsFile, lyricsText, {
+    width: COVER_OUTPUT.width,
+    height: COVER_OUTPUT.height,
+    duration: effectiveDuration
+  });
 
   const cleanup = () => {
     fs.unlink(tempAudio, () => {});
     fs.unlink(tempCover, () => {});
     fs.unlink(tempMp4, () => {});
+    removeTextAssets(textAssets);
+    fs.unlink(lyricsFile, () => {});
   };
 
   const releaseAndCleanup = () => {
@@ -459,25 +507,27 @@ async function _doGenerateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration) {
 
     console.log(`[MP4] 正在封装: ${mp4CacheKey}`);
 
-    const vf = [
-      `scale=${COVER_OUTPUT.width}:${COVER_OUTPUT.height}:force_original_aspect_ratio=decrease`,
-      `pad=${COVER_OUTPUT.width}:${COVER_OUTPUT.height}:(ow-iw)/2:(oh-ih)/2`,
-      'setsar=1'
-    ].join(',');
+    const visualFilter = buildVisualFilter({
+      width: COVER_OUTPUT.width,
+      height: COVER_OUTPUT.height,
+      fps: VIDEO_VISUAL_FPS,
+      duration: effectiveDuration,
+      textFiles: textAssets.files,
+      lyricsFile
+    });
 
     // MP4 copy：只编码封面静态图片，音频直接复制不重编码
     const ffmpegArgs = [
       '-loop', '1',
-      '-framerate', '1',
+      '-framerate', String(VIDEO_VISUAL_FPS),
       '-i', tempCover,
       '-i', tempAudio,
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-tune', 'stillimage',
-      '-crf', '28',
-      '-pix_fmt', 'yuv420p',
-      '-vf', vf,
-      '-r', '1',
+      '-filter_complex', visualFilter,
+      '-map', '[vout]',
+      '-map', '1:a:0',
+      ...VIDEO_ENCODER.args,
+      '-pix_fmt', VIDEO_ENCODER.pixelFormat,
+      '-r', String(VIDEO_VISUAL_FPS),
       '-c:a', 'copy',
       '-movflags', '+faststart',
       '-shortest',
@@ -488,6 +538,7 @@ async function _doGenerateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration) {
     await runFFmpeg(ffmpegArgs, mp4CacheKey);
 
     // 移动到缓存
+    if (fs.existsSync(destMp4)) fs.unlinkSync(destMp4);
     fs.renameSync(tempMp4, destMp4);
 
     const stat = fs.statSync(destMp4);
@@ -495,7 +546,7 @@ async function _doGenerateMp4(mp4CacheKey, audioUrl, coverUrl, songDuration) {
       version: MP4_CACHE_VERSION,
       cacheKey: mp4CacheKey,
       size: stat.size,
-      duration: songDuration || 0,
+      duration: effectiveDuration,
       createdAt: Date.now(),
       video: { width: COVER_OUTPUT.width, height: COVER_OUTPUT.height }
     };
@@ -624,7 +675,7 @@ router.get('/:token/:playlistId/:songId.mp4', async (req, res) => {
   const cachedMp4 = getMp4FilePath(mp4CacheKey);
 
   // 缓存命中：直接流式返回
-  if (fs.existsSync(cachedMp4)) {
+  if (isMp4Cached(mp4CacheKey)) {
     const stat = fs.statSync(cachedMp4);
     logPlay(user.id, songId, playlistId, adapter);
 
@@ -658,13 +709,17 @@ router.get('/:token/:playlistId/:songId.mp4', async (req, res) => {
     const cookie = decrypt(user.cookie);
 
     // 获取歌曲音频 URL
-    const audioUrl = await adapter.getSongUrl(songId, cookie);
+    const [audioUrl, lyricsText] = await Promise.all([
+      adapter.getSongUrl(songId, cookie),
+      adapter.getLyrics(songId, cookie)
+    ]);
     if (!audioUrl) {
       return res.status(404).type('text/plain').send('Song not available');
     }
 
     // 从歌单缓存获取封面
     let coverUrl = DEFAULT_COVER_URL;
+    let matchedSong = null;
     const playlistCacheKey = getPlaylistCacheKey(playlistId, source);
     const cached = playlistOps.get.get(playlistCacheKey);
     if (cached) {
@@ -674,6 +729,7 @@ router.get('/:token/:playlistId/:songId.mp4', async (req, res) => {
         const song = Array.isArray(songs) ? songs.find(s =>
           String(s[idField] || s.id) === String(songId)
         ) : null;
+        matchedSong = song;
         if (song) {
           coverUrl = pickCoverUrlForSong(song, cached.cover);
         } else if (cached.cover) {
@@ -682,7 +738,25 @@ router.get('/:token/:playlistId/:songId.mp4', async (req, res) => {
       } catch (_) {}
     }
 
-    const info = await generateMp4(mp4CacheKey, audioUrl, coverUrl, 0);
+    if (!matchedSong?.album) {
+      try {
+        const refreshed = await adapter.getPlaylistDetail(playlistId, cookie);
+        cachePlaylistDetail(playlistId, source, refreshed);
+        matchedSong = Array.isArray(refreshed.tracks)
+          ? refreshed.tracks.find((song) => getSongIdForTrack(song, source) === String(songId))
+          : matchedSong;
+        if (matchedSong) coverUrl = pickCoverUrlForSong(matchedSong, refreshed.cover || coverUrl);
+      } catch (_) {}
+    }
+
+    const info = await generateMp4(
+      mp4CacheKey,
+      audioUrl,
+      coverUrl,
+      matchedSong?.duration,
+      matchedSong || { id: songId },
+      lyricsText
+    );
     logPlay(user.id, songId, playlistId, adapter);
 
     const stat = fs.statSync(cachedMp4);

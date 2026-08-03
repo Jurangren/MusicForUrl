@@ -14,6 +14,8 @@ const {
   verifyPlaybackToken,
   isLegacyToken
 } = require('../lib/playback-token');
+const { parseQQSongMid, createVirtualPlaylistId } = require('../lib/music-input');
+const { resolveGenerationProfile, buildGenerationQuery } = require('../lib/generation-profile');
 
 function isLikelyToken(token) {
   return typeof token === 'string' && token.length > 0 && token.length <= 1024;
@@ -183,7 +185,8 @@ router.get('/user', qqAuth, async (req, res) => {
 
 router.get('/parse', qqAuth, async (req, res) => {
   const input = req.query.url;
-  const playlistId = parseQQPlaylistId(input);
+  const songMid = parseQQSongMid(input);
+  const playlistId = songMid ? createVirtualPlaylistId('qq', songMid) : parseQQPlaylistId(input);
 
   if (!playlistId) {
     return res.status(400).json({ success: false, message: '无效的QQ音乐歌单链接或ID' });
@@ -209,17 +212,26 @@ router.get('/parse', qqAuth, async (req, res) => {
     }
 
     const cookie = decrypt(req.qqUser.cookie);
-    const playlist = await qqmusic.getPlaylistDetail(playlistId, cookie);
+    const playlist = songMid
+      ? (() => qqmusic.getSongDetail(songMid, cookie).then((track) => ({
+          id: playlistId,
+          name: track.name,
+          cover: track.cover,
+          songCount: 1,
+          tracks: [track]
+        })))()
+      : await qqmusic.getPlaylistDetail(playlistId, cookie);
+    const resolvedPlaylist = await playlist;
 
     const ttlSec = parseInt(process.env.CACHE_TTL) || 86400;
     const expiresAt = toSqliteDatetime(new Date(Date.now() + ttlSec * 1000));
 
     playlistOps.set.run({
       playlist_id: cacheKey,
-      name: playlist.name || '',
-      cover: playlist.cover || '',
-      song_count: playlist.songCount || 0,
-      songs: JSON.stringify(playlist.tracks || []),
+      name: resolvedPlaylist.name || '',
+      cover: resolvedPlaylist.cover || '',
+      song_count: resolvedPlaylist.songCount || 0,
+      songs: JSON.stringify(resolvedPlaylist.tracks || []),
       expires_at: expiresAt
     });
 
@@ -227,9 +239,10 @@ router.get('/parse', qqAuth, async (req, res) => {
       success: true,
       data: {
         id: playlistId,
-        name: playlist.name,
-        cover: playlist.cover,
-        songCount: playlist.songCount
+        name: resolvedPlaylist.name,
+        cover: resolvedPlaylist.cover,
+        songCount: resolvedPlaylist.songCount,
+        inputType: songMid ? 'song' : 'playlist'
       }
     });
   } catch (e) {
@@ -242,6 +255,9 @@ router.get('/parse', qqAuth, async (req, res) => {
 
 router.get('/url', qqAuth, (req, res) => {
   const playlistId = String(req.query.id || '');
+  const order = String(req.query.order || '').toLowerCase() === 'shuffle' ? 'shuffle' : 'sequential';
+  const profile = resolveGenerationProfile(req.query);
+  const { mode, quality, resolution, fps, concurrency } = profile;
 
   if (!/^\d+$/.test(playlistId)) {
     return res.status(400).json({ success: false, message: '无效的歌单ID' });
@@ -252,29 +268,19 @@ router.get('/url', qqAuth, (req, res) => {
     playlistId
   });
 
-  const baseUrl = getBaseUrl(req);
-  const hlsUrl = `${baseUrl}/api/qq/hls/${encodeURIComponent(playbackToken)}/${playlistId}/master.m3u8`;
-  const liteUrl = `${baseUrl}/api/qq/playlist/m3u8/${encodeURIComponent(playbackToken)}/${playlistId}/stream.m3u8`;
+  const generationQuery = buildGenerationQuery({ order, mode, quality, resolution, fps, concurrency });
+  const generationPath = `/api/qq/playlist-video/${encodeURIComponent(playbackToken)}/${playlistId}/generate${generationQuery}`;
 
   res.json({
     success: true,
     data: {
-      url: liteUrl,
-      urls: [
-        {
-          type: 'lite',
-          label: '轻量 M3U8（仅音频）',
-          url: liteUrl,
-          note: '无需转码，即时播放。VRChat 可能不支持，建议在支持 HLS 直播流的播放器中使用。'
-        },
-        {
-          type: 'hls',
-          label: 'HLS 转码',
-          url: hlsUrl,
-          note: 'VRChat 兼容性最佳，带封面视频。首次播放需等待转码，后续自动缓存。'
-        }
-      ],
-      default: 'lite'
+      generationPath,
+      order,
+      mode,
+      quality,
+      resolution,
+      fps,
+      concurrency
     }
   });
 });

@@ -21,7 +21,7 @@ services:
       CACHE_TTL: 86400
 
       # HLS/FFmpeg：高并发（按实际 CPU 负载再调）
-      HLS_MAX_CONCURRENT_JOBS: 4
+      HLS_MAX_CONCURRENT_JOBS: 8
       HLS_MAX_QUEUE: 20
       HLS_AUTO_PRELOAD_COUNT: 2
       HLS_FFMPEG_THREADS: 2

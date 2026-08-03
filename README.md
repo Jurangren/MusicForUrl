@@ -1,15 +1,10 @@
 # MusicForUrl
 
-将音乐歌单转换为可在视频播放器中播放的 M3U8 链接，支持多用户登录、VIP 歌曲播放。
+将音乐歌单转换为可直接播放、拖动的整单 MP4 链接，支持多用户登录、VIP 歌曲播放。
 
 服务器进行加密存储Cookie，防止用户信息泄露。
 
-生成链接时提供三种输出：
-- **轻量 M3U8（直链列表，优先推荐）**：几乎不转码/不落盘，服务器压力更小；大部分 VRChat 播放器可用，但不会显示视频画面（仅音频），兼容性仍取决于播放器实现。
-- **视频轻量 M3U8（随机背景图）**：基于轻量直链输出音频清单，并附带统一背景图元数据；同一播放链接固定同一张图，图片 API 异常会自动回退歌单封面。
-- **HLS（转码分片）**：兼容性更稳，但会消耗较多 CPU/磁盘（需要 FFmpeg）；当轻量模式无法播放时再切换。
-
-说明：视频轻量是否显示背景图，取决于播放器或上层系统是否识别自定义元数据标签/参数。
+生成完成后提供一个整张歌单 MP4 直链：分辨率可选 1920x1080（默认）或 1600x900，帧率可选 5、10、15（默认），标准模式还可选 30FPS；保留专辑静态模糊背景、双语同步歌词和播放进度，并支持 HTTP Range 拖动播放。
 
 ## 快速开始
 
@@ -23,6 +18,8 @@ npm start
 ```
 
 默认端口 `3000`，可通过 `PORT` 修改。
+
+首次打开管理界面时，系统会要求设置至少 8 位的后台访问密钥。密钥只以加盐哈希形式保存在 `data/site-access.json`；也可以继续通过 `SITE_PASSWORD` 环境变量预先配置。
 
 ### Docker 部署
 
@@ -166,7 +163,12 @@ environment:
 | `PORT` | 服务端口 | `3000` |
 | `NODE_ENV` | 环境标识 | `development` |
 | `ENCRYPTION_KEY` | Cookie 加密密钥（生产环境必填，建议 32 位字符串） | - |
-| `SITE_PASSWORD` | 站点访问密码（可选） | - |
+| `SITE_PASSWORD` | 预设后台密钥（未配置则首次访问创建） | - |
+| `VIDEO_VISUAL_FPS` | 视频画面与歌词动画帧率（5~30 FPS） | `15` |
+| `VIDEO_TRANSITION_SECONDS` | 歌曲首尾整幅画面的渐入渐出时长（秒） | `0.8` |
+| `VIDEO_ENCODER` | 视频编码器：`auto` / `nvenc` / `qsv` / `amf` / `cpu` | `auto` |
+| `PLAYLIST_GENERATION_CONCURRENCY` | 同一张歌单并行生成的歌曲数 | `4` |
+| `VIDEO_FONT_FILE` | 视频中文字体文件路径（可选） | 自动检测 |
 | `ADMIN_PASSWORD` | 管理接口密码（可选，用于 `/api/hls/cache/*`） | - |
 | `HLS_ADMIN_ENABLED` | 是否启用 HLS 管理接口（`1/true` 开启；默认关闭；需同时设置 `ADMIN_PASSWORD`） | - |
 | `CACHE_TTL` | 歌单缓存时间（秒） | `86400` |
@@ -176,24 +178,14 @@ environment:
 
 | 环境变量 | 说明 | 默认值 |
 |---|---|---|
-| `BASE_URL` | 公网访问地址（用于生成 m3u8 中的 URL） | - |
+| `BASE_URL` | 公网访问地址（用于生成 MP4 直链） | - |
 | `TRUST_PROXY` | 信任的代理层数或 IP/子网（不要设为 `true`） | `loopback` |
-
-### 限流（每分钟）
-
-| 环境变量 | 说明 | 默认值 |
-|---|---|---|
-| `RATE_LIMIT_GLOBAL` | 全局 API 限流 | `200` |
-| `RATE_LIMIT_AUTH` | 认证接口限流 | `10` |
-| `RATE_LIMIT_PARSE` | 歌单解析限流 | `30` |
-| `RATE_LIMIT_HLS_STREAM` | `stream.m3u8` 限流 | `60` |
-| `RATE_LIMIT_HLS_SEGMENT` | `.ts` 分片限流 | `600` |
 
 ### HLS / FFmpeg
 
 | 环境变量 | 说明 | 默认值 |
 |---|---|---|
-| `HLS_MAX_CONCURRENT_JOBS` | 最大并发转码任务数 | `2` |
+| `HLS_MAX_CONCURRENT_JOBS` | 最大并发转码任务数 | `4` |
 | `HLS_MAX_QUEUE` | 最大等待队列长度（超出返回 503） | `10` |
 | `HLS_DOWNLOAD_TIMEOUT` | 音频/封面下载超时（毫秒） | `60000` |
 | `HLS_DOWNLOAD_MAX_SIZE` | 下载最大字节数 | `104857600` |
@@ -224,8 +216,7 @@ environment:
 
 | 环境变量 | 说明 | 默认值 |
 |---|---|---|
-| `MUSIC_QUALITY` | `low/medium/high/lossless` | `low` |
-| `MUSIC_BITRATE` | 直接指定码率（bps，优先级低于 `MUSIC_QUALITY` 预设） | - |
+| `MUSIC_QUALITY` | 固定为 `high`，网易云请求 320kbps、QQ 使用 M800 | `high` |
 
 ### 视频轻量随机背景图
 
@@ -238,8 +229,8 @@ environment:
 
 | 环境变量 | 说明 | 默认值 |
 |---|---|---|
-| `COVER_WIDTH` | 输出宽度 | `1920` |
-| `COVER_HEIGHT` | 输出高度 | `1080` |
+| `COVER_WIDTH` | 未指定界面参数时的回退输出宽度 | `1920` |
+| `COVER_HEIGHT` | 未指定界面参数时的回退输出高度 | `1080` |
 | `COVER_FPS` | 帧率（静态封面建议 1~5，可显著降压） | `5` | 
 | `DEFAULT_COVER_URL` | 默认封面 URL | 内置默认值 |
 
