@@ -25,6 +25,7 @@ const {
 } = require('../lib/output-filename');
 const { estimateGenerationTiming } = require('../lib/generation-estimate');
 const { SerialJobQueue } = require('../lib/serial-job-queue');
+const { moveFileSync } = require('../lib/file-move');
 const {
   resolveGenerationProfile,
   normalizeGenerationResolution,
@@ -1485,8 +1486,10 @@ function buildPlaylistMp4(job, songs) {
         reject(error);
       } else {
         try {
-          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-          fs.renameSync(tempOutput, outputPath);
+          const moveResult = moveFileSync(tempOutput, outputPath);
+          if (!moveResult.sourceRemoved) {
+            console.warn(`[整单生成] MP4 已跨磁盘复制到输出目录，但临时源文件清理失败: ${tempOutput}`);
+          }
           resolve(outputPath);
         } catch (moveError) {
           reject(moveError);
