@@ -1780,7 +1780,7 @@ function generationTaskMeta(job) {
   const mode = job.mode === 'ultra_fast' ? '极速' : (job.mode === 'fast' ? '平衡' : '质量');
   const source = job.source === 'qq' ? 'QQ音乐' : '网易云';
   if (job.taskType === 'upload_only') return `${source} · 仅上传本地视频`;
-  return `${source} · ${quality} · ${mode} · ${escapeHtml(job.resolution || '')} · ${Number(job.fps) || 1}FPS · ${Number(job.requestedConcurrency) || 4} 并发`;
+  return `${source} · ${quality} · ${mode} · ${escapeHtml(job.resolution || '')} · ${Number(job.fps) || 1}FPS · 音量 ${Number.isFinite(Number(job.volume)) ? Number(job.volume) : 100}% · ${Number(job.requestedConcurrency) || 4} 并发`;
 }
 
 function generationTaskOutput(job) {
@@ -2022,6 +2022,12 @@ function syncGenerationOptionAvailability() {
   if (notice) notice.hidden = !fixedFpsMode;
 }
 
+function syncGenerationVolumeDisplay(value) {
+  const volume = Math.max(0, Math.min(200, Math.round(Number(value) || 0)));
+  const output = document.getElementById('generationVolumeValue');
+  if (output) output.textContent = `${volume}%`;
+}
+
 function confirmHighConcurrencySelection(input) {
   if (!input?.checked) return;
   const nextConcurrency = Number(input.value);
@@ -2100,6 +2106,10 @@ async function generatePlaylist() {
       : ([5, 10, 15, 30].includes(requestedFps) ? requestedFps : 15);
     const requestedConcurrency = Number(document.querySelector('input[name="generationConcurrency"]:checked')?.value);
     const generationConcurrency = [2, 4, 6, 8, 16].includes(requestedConcurrency) ? requestedConcurrency : 4;
+    const requestedVolume = Number(document.getElementById('generationVolume')?.value);
+    const generationVolume = Number.isFinite(requestedVolume)
+      ? Math.max(0, Math.min(200, Math.round(requestedVolume)))
+      : 100;
     const parseScope = isQQ ? 'QQ_PLAYLIST_PARSE' : 'PLAYLIST_PARSE';
     const urlScope = isQQ ? 'QQ_PLAYLIST_URL' : 'PLAYLIST_URL';
     const parseRes = await callApi('/playlist/parse?url=' + encodeURIComponent(input), {}, parseScope);
@@ -2116,7 +2126,7 @@ async function generatePlaylist() {
         (generationMode ? '&mode=' + generationMode : '') +
         '&quality=' + generationQuality +
         '&resolution=' + generationResolution + '&fps=' + generationFps +
-        '&concurrency=' + generationConcurrency,
+        '&concurrency=' + generationConcurrency + '&volume=' + generationVolume,
       {},
       urlScope
     );

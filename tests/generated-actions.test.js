@@ -152,6 +152,19 @@ test('audio quality can be selected and defaults to high', () => {
   assert.match(main, /'&quality=' \+ generationQuality/);
 });
 
+test('playlist output volume uses a 0% to 200% slider and is applied during final audio merge', () => {
+  const home = fs.readFileSync(path.join(publicDir, 'views', 'home.html'), 'utf8');
+  const main = fs.readFileSync(path.join(publicDir, 'js', 'main.js'), 'utf8');
+  const hls = fs.readFileSync(path.join(__dirname, '..', 'routes', 'hls.js'), 'utf8');
+  assert.match(home, /id="generationVolume" type="range" min="0" max="200" step="5" value="100"/);
+  assert.match(main, /'&concurrency=' \+ generationConcurrency \+ '&volume=' \+ generationVolume/);
+  assert.match(hls, /'-c:v', 'copy'/);
+  assert.match(hls, /volumeMultiplier === 1[\s\S]*\['-c:a', 'copy', '-bsf:a', 'aac_adtstoasc'\]/);
+  assert.match(hls, /\['-c:a', 'aac', '-b:a', getGenerationAudioBitrate\(job\.quality\), '-af', `volume=\$\{volumeMultiplier\.toFixed\(2\)\}`\]/);
+  assert.match(hls, /'-c:v', 'copy',[\s\S]*\.\.\.audioArgs/);
+  assert.match(hls, /volume: Number\.isFinite\(Number\(job\.volume\)\)/);
+});
+
 test('generation concurrency supports 2, 4, 6, 8 and 16 with 4 selected by default', () => {
   const home = fs.readFileSync(path.join(publicDir, 'views', 'home.html'), 'utf8');
   const main = fs.readFileSync(path.join(publicDir, 'js', 'main.js'), 'utf8');

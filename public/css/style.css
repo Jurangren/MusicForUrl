@@ -365,6 +365,29 @@ input:checked + .slider:before {
   font-size: 0.84rem;
 }
 
+.generation-volume {
+  display: grid;
+  grid-template-columns: auto minmax(160px, 320px) 3.5rem;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.65rem 0.35rem 0.05rem;
+  color: var(--text-dim);
+  font-size: 0.84rem;
+}
+
+.generation-volume input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.generation-volume output {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: right;
+}
+
 .generation-order > span,
 .generation-mode > span,
 .generation-quality > span,

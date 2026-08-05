@@ -31,7 +31,8 @@ const {
   normalizeGenerationResolution,
   normalizeGenerationFps,
   normalizeGenerationQuality,
-  getGenerationAudioBitrate
+  getGenerationAudioBitrate,
+  getGenerationVolumeMultiplier
 } = require('../lib/generation-profile');
 
 function isValidNumericId(id) {
@@ -651,7 +652,7 @@ function getSegmentInfoPath(songCacheKey) {
   return path.join(getSongCacheDir(songCacheKey), 'info.json');
 }
 
-function getPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', playlistName = '', order = 'sequential', resolution = '1920x1080', fps = 15) {
+function getPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', playlistName = '', order = 'sequential', resolution = '1920x1080', fps = 15, volume = 100) {
   const options = {
     name: playlistName,
     source,
@@ -659,6 +660,7 @@ function getPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', pla
     quality,
     resolution,
     fps,
+    volume,
     order,
     playlistId,
     version: CACHE_VERSION
@@ -666,10 +668,10 @@ function getPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', pla
   return path.join(PLAYLIST_MP4_DIR, buildPlaylistOutputFilename(options));
 }
 
-function findPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', playlistName = '', order = 'sequential', resolution = '1920x1080', fps = 15) {
-  const preferred = getPlaylistMp4Path(source, playlistId, mode, quality, playlistName, order, resolution, fps);
+function findPlaylistMp4Path(source, playlistId, mode = '', quality = 'high', playlistName = '', order = 'sequential', resolution = '1920x1080', fps = 15, volume = 100) {
+  const preferred = getPlaylistMp4Path(source, playlistId, mode, quality, playlistName, order, resolution, fps, volume);
   if (fs.existsSync(preferred)) return preferred;
-  const options = { source, mode, quality, name: playlistName, resolution, fps, order, playlistId, version: CACHE_VERSION };
+  const options = { source, mode, quality, name: playlistName, resolution, fps, volume, order, playlistId, version: CACHE_VERSION };
   const legacyStorageKey = playlistOutputIdentity(options).replace(/\.mp4$/i, '');
   const legacyPreferred = path.join(PLAYLIST_MP4_DIR, legacyStorageKey, buildPlaylistOutputFilename(options));
   if (fs.existsSync(legacyPreferred)) return legacyPreferred;
@@ -1425,8 +1427,8 @@ function getBaseUrl(req) {
   return `${req.protocol}://${req.get('host')}`;
 }
 
-function generationJobKey(source, userId, playlistId, mode, quality, resolution, fps, order) {
-  return `${source}:${userId}:${playlistId}:${mode || 'default'}:${quality}:${resolution}:${fps}fps:${order === 'shuffle' ? 'shuffle' : 'sequential'}`;
+function generationJobKey(source, userId, playlistId, mode, quality, resolution, fps, volume, order) {
+  return `${source}:${userId}:${playlistId}:${mode || 'default'}:${quality}:${resolution}:${fps}fps:${volume}vol:${order === 'shuffle' ? 'shuffle' : 'sequential'}`;
 }
 
 function generationStatusPath(source, token, playlistId, jobId) {
@@ -1446,7 +1448,7 @@ function generationCancelledError() {
 
 function buildPlaylistMp4(job, songs) {
   if (job.cancelRequested) return Promise.reject(generationCancelledError());
-  const outputPath = getPlaylistMp4Path(job.source, job.playlistId, job.mode, job.quality, job.playlistName, job.order, job.resolution, job.fps);
+  const outputPath = getPlaylistMp4Path(job.source, job.playlistId, job.mode, job.quality, job.playlistName, job.order, job.resolution, job.fps, job.volume);
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   const tempKey = `${job.source}_${job.playlistId}_${job.id}`.replace(/[^A-Za-z0-9_-]/g, '_');
   const listPath = path.join(TEMP_DIR, `${tempKey}_concat.txt`);
@@ -1472,6 +1474,11 @@ function buildPlaylistMp4(job, songs) {
 
   if (entries.length === 0) return Promise.reject(new Error('没有可合并的视频片段'));
   fs.writeFileSync(listPath, `${entries.join('\n')}\n`, 'utf8');
+
+  const volumeMultiplier = getGenerationVolumeMultiplier(job.volume);
+  const audioArgs = volumeMultiplier === 1
+    ? ['-c:a', 'copy', '-bsf:a', 'aac_adtstoasc']
+    : ['-c:a', 'aac', '-b:a', getGenerationAudioBitrate(job.quality), '-af', `volume=${volumeMultiplier.toFixed(2)}`];
 
   return new Promise((resolve, reject) => {
     let stderr = '';
@@ -1502,8 +1509,8 @@ function buildPlaylistMp4(job, songs) {
       '-fflags', '+genpts',
       '-f', 'concat', '-safe', '0', '-i', listPath,
       '-map', '0:v:0', '-map', '0:a:0',
-      '-c', 'copy',
-      '-bsf:a', 'aac_adtstoasc',
+      '-c:v', 'copy',
+      ...audioArgs,
       '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart',
       '-y', tempOutput
@@ -1625,6 +1632,7 @@ function generationJobSnapshot(job) {
     quality: job.quality,
     resolution: job.resolution,
     fps: job.fps,
+    volume: Number.isFinite(Number(job.volume)) ? Number(job.volume) : 100,
     localPath: job.outputPath ? path.resolve(job.outputPath) : '',
     uploadStatus: job.uploadStatus || (job.outputPath ? 'pending' : 'waiting'),
     uploadPercent: Math.max(0, Math.min(100, Number(job.uploadPercent) || 0)),
@@ -2232,14 +2240,14 @@ router.post('/:token/:playlistId/generate', (req, res) => {
   const { token, playlistId } = req.params;
   const source = getSourceFromReq(req);
   const profile = getRenderProfileFromReq(req);
-  const { mode, quality, resolution, fps, concurrency } = profile;
+  const { mode, quality, resolution, fps, concurrency, volume } = profile;
   const order = getPlaybackOrderFromReq(req);
   if (!isLikelyToken(token)) return res.status(400).json({ success: false, message: '无效的播放凭证' });
   if (!isValidNumericId(playlistId)) return res.status(400).json({ success: false, message: '无效的歌单 ID' });
   const user = resolveUserFromAccessToken(token, playlistId, source);
   if (!user) return res.status(401).json({ success: false, message: '播放凭证已失效' });
 
-  const key = generationJobKey(source, user.id, playlistId, mode, quality, resolution, fps, order);
+  const key = generationJobKey(source, user.id, playlistId, mode, quality, resolution, fps, volume, order);
   const activeId = activePlaylistGenerationJobs.get(key);
   const activeJob = activeId ? playlistGenerationJobs.get(activeId) : null;
   if (activeJob && isGenerationJobActive(activeJob)) {
@@ -2258,6 +2266,7 @@ router.post('/:token/:playlistId/generate', (req, res) => {
     quality,
     resolution,
     fps,
+    volume,
     requestedConcurrency: concurrency,
     order,
     userId: user.id,
@@ -2332,7 +2341,7 @@ router.get('/:token/:playlistId/playlist.mp4', (req, res) => {
   const { token, playlistId } = req.params;
   const source = getSourceFromReq(req);
   const profile = getRenderProfileFromReq(req);
-  const { mode, quality, resolution, fps } = profile;
+  const { mode, quality, resolution, fps, volume } = profile;
   const order = getPlaybackOrderFromReq(req);
   if (!isLikelyToken(token)) return res.status(400).type('text/plain').send('Invalid token');
   if (!isValidNumericId(playlistId)) return res.status(400).type('text/plain').send('Invalid playlist id');
@@ -2341,7 +2350,7 @@ router.get('/:token/:playlistId/playlist.mp4', (req, res) => {
 
   const cachedPlaylist = playlistOps.get.get(getPlaylistCacheKey(playlistId, source));
   const playlistName = cachedPlaylist?.name || '';
-  const filePath = findPlaylistMp4Path(source, playlistId, mode, quality, playlistName, order, resolution, fps);
+  const filePath = findPlaylistMp4Path(source, playlistId, mode, quality, playlistName, order, resolution, fps, volume);
   if (!fs.existsSync(filePath)) {
     res.setHeader('Retry-After', '5');
     return res.status(409).type('text/plain').send('Playlist MP4 is not generated yet');
@@ -2353,7 +2362,7 @@ router.get('/:token/:playlistId/playlist.mp4', (req, res) => {
   res.setHeader('Cache-Control', 'private, max-age=86400');
   const modeLabel = isUltraFastGenerationMode(mode) ? '极速' : (isBalancedGenerationMode(mode) ? '平衡' : '质量');
   const qualityLabel = { low: '低', medium: '中', high: '高' }[quality];
-  const downloadName = `${sanitizeOutputFileStem(playlistName, `playlist-${playlistId}`)}_${qualityLabel}_${modeLabel}_${resolution}_${fps}FPS.mp4`;
+  const downloadName = `${sanitizeOutputFileStem(playlistName, `playlist-${playlistId}`)}_${qualityLabel}_${modeLabel}_${resolution}_${fps}FPS_VOL${volume}.mp4`;
   res.setHeader(
     'Content-Disposition',
     `inline; filename="playlist-${playlistId}.mp4"; filename*=UTF-8''${encodeURIComponent(downloadName)}`

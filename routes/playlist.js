@@ -245,7 +245,7 @@ router.get('/url', auth, (req, res) => {
   const playlistId = String(req.query.id || '');
   const order = String(req.query.order || '').toLowerCase() === 'shuffle' ? 'shuffle' : 'sequential';
   const profile = resolveGenerationProfile(req.query);
-  const { mode, quality, resolution, fps, concurrency } = profile;
+  const { mode, quality, resolution, fps, concurrency, volume } = profile;
 
   if (!isValidNumericId(playlistId)) {
     return res.status(400).json({ success: false, message: '无效的歌单ID' });
@@ -256,7 +256,7 @@ router.get('/url', auth, (req, res) => {
     playlistId
   });
 
-  const generationQuery = buildGenerationQuery({ order, mode, quality, resolution, fps, concurrency });
+  const generationQuery = buildGenerationQuery({ order, mode, quality, resolution, fps, concurrency, volume });
   const generationPath = `/api/playlist-video/${encodeURIComponent(playbackToken)}/${playlistId}/generate${generationQuery}`;
 
   res.json({
@@ -268,7 +268,8 @@ router.get('/url', auth, (req, res) => {
       quality,
       resolution,
       fps,
-      concurrency
+      concurrency,
+      volume
     }
   });
 });

@@ -28,6 +28,12 @@
     <label><input type="radio" name="generationQuality" value="medium"><span>中音质</span></label>
     <label><input type="radio" name="generationQuality" value="high" checked><span>高音质</span></label>
   </div>
+  <div class="generation-volume">
+    <label for="generationVolume">输出音量</label>
+    <input id="generationVolume" type="range" min="0" max="200" step="5" value="100"
+      oninput="syncGenerationVolumeDisplay(this.value)" aria-label="输出音量百分比">
+    <output id="generationVolumeValue" for="generationVolume">100%</output>
+  </div>
   <div class="generation-resolution" role="radiogroup" aria-label="输出分辨率">
     <span>输出分辨率</span>
     <label><input type="radio" name="generationResolution" value="1600x900"><span>1600×900</span></label>
