@@ -163,6 +163,8 @@ test('playlist output volume uses a 0% to 200% slider and is applied during fina
   assert.match(hls, /\['-c:a', 'aac', '-b:a', getGenerationAudioBitrate\(job\.quality\), '-af', `volume=\$\{volumeMultiplier\.toFixed\(2\)\}`\]/);
   assert.match(hls, /'-c:v', 'copy',[\s\S]*\.\.\.audioArgs/);
   assert.match(hls, /volume: Number\.isFinite\(Number\(job\.volume\)\)/);
+  assert.match(hls, /profile\.volume}vol:/);
+  assert.match(hls, /getScopedSongCacheKey\(songId, job\.source, job\.mode, job\.quality, job\.resolution, job\.fps, renderContext, job\.volume\)/);
 });
 
 test('generation concurrency supports 2, 4, 6, 8 and 16 with 4 selected by default', () => {

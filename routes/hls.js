@@ -132,14 +132,14 @@ function isValidSongIdForSource(songId, source) {
   return isValidNumericId(raw);
 }
 
-function getScopedSongCacheKey(songId, source, mode, quality, resolution, fps, renderContext = null) {
+function getScopedSongCacheKey(songId, source, mode, quality, resolution, fps, renderContext = null, volume = 100) {
   const sid = String(songId || '').trim();
   const src = source === 'qq' ? 'qq' : 'netease';
-  const profile = resolveGenerationProfile({ mode, quality, resolution, fps }, { allowLiteVideo: true });
+  const profile = resolveGenerationProfile({ mode, quality, resolution, fps, volume }, { allowLiteVideo: true });
   const modeKey = isUltraFastGenerationMode(profile.mode)
     ? 'ultra_fast'
     : (isBalancedGenerationMode(profile.mode) ? 'fast' : (isLiteVideoMode(profile.mode) ? 'lite_video' : 'default'));
-  const base = `${src}:${modeKey}:${profile.quality}:${profile.resolution}:${profile.fps}fps:${sid}`;
+  const base = `${src}:${modeKey}:${profile.quality}:${profile.resolution}:${profile.fps}fps:${profile.volume}vol:${sid}`;
   if (!renderContext || !renderContext.playlistId) return base;
   const identity = JSON.stringify({
     playlistId: String(renderContext.playlistId),
@@ -176,7 +176,8 @@ function getProfileFromSongCacheKey(songCacheKey) {
     mode,
     quality: normalizeGenerationQuality(parts[2]),
     resolution: normalizeGenerationResolution(parts[3]),
-    fps: normalizeGenerationFps(String(parts[4] || '').replace(/fps$/i, ''), mode)
+    fps: normalizeGenerationFps(String(parts[4] || '').replace(/fps$/i, ''), mode),
+    volume: String(parts[5] || '').replace(/vol$/i, '')
   }, { allowLiteVideo: true });
 }
 
@@ -1460,7 +1461,7 @@ function buildPlaylistMp4(job, songs) {
     const song = songs[songIndex];
     const songId = getSongIdForTrack(song, job.source);
     const renderContext = createSongRenderContext(job, songIndex + 1, songs.length);
-    const songCacheKey = getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext);
+    const songCacheKey = getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext, job.volume);
     const info = getSongSegmentInfo(songCacheKey);
     if (!info || !Number.isInteger(info.segmentCount) || info.segmentCount < 1) {
       return Promise.reject(new Error(`歌曲 ${songId} 的视频缓存不完整`));
@@ -1842,7 +1843,7 @@ async function runPlaylistGenerationJob(job, { adapter, cookie, token }) {
     const protectedCacheKeys = songs.map((song, index) => {
       const songId = getSongIdForTrack(song, job.source);
       const renderContext = createSongRenderContext(job, index + 1, songs.length);
-      return getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext);
+      return getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext, job.volume);
     });
     for (const cacheKey of protectedCacheKeys) protectSongCacheForJob(job, cacheKey);
     const plannedWorkSeconds = songs.map((song, index) => {
@@ -1881,7 +1882,7 @@ async function runPlaylistGenerationJob(job, { adapter, cookie, token }) {
 
         const songName = song.name || song.title || songId;
         const renderContext = createSongRenderContext(job, index + 1, songs.length);
-        const songCacheKey = getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext);
+        const songCacheKey = getScopedSongCacheKey(songId, job.source, job.mode, job.quality, job.resolution, job.fps, renderContext, job.volume);
         const needsGeneration = !isSongCached(songCacheKey);
         let workSeconds = needsGeneration ? plannedWorkSeconds[index] : 0;
         if (!needsGeneration && plannedWorkSeconds[index] > 0) {
